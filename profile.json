@@ -1,0 +1,34 @@
+{
+  "name": "Student",
+  "degree": "B.Tech",
+  "fields": ["Computer Science", "Data Science"],
+  "grad_year": 2027,
+  "fulltime_available_from": "2026-12-15",
+  "want_roles": [
+    "AI/ML Engineer", "Machine Learning Engineer", "AI Engineer", "ML Engineer",
+    "Machine Learning Intern", "AI Intern", "Deep Learning Engineer",
+    "ML Research Intern", "Data Scientist", "Data Analyst",
+    "Software Engineer", "Software Developer", "Backend Engineer",
+    "Full Stack Developer", "Computer Vision Engineer", "NLP Engineer",
+    "GenAI Engineer", "LLM Engineer", "AI/ML Intern", "SDE Intern"
+  ],
+  "have_skills": [
+    "Python", "C++", "Java", "JavaScript", "SQL", "Git", "Machine Learning",
+    "Deep Learning", "PyTorch", "TensorFlow", "scikit-learn", "Pandas", "NumPy",
+    "NLP", "Computer Vision", "LLM", "Data Structures", "Algorithms",
+    "HTML/CSS", "React", "REST API"
+  ],
+  "missing_skills": [
+    "AWS", "Docker", "Kubernetes", "Spark", "Kafka", "Golang", "Rust",
+    "Scala", "LangChain", "MLOps", "Airflow"
+  ],
+  "major_companies": [
+    "Google", "Microsoft", "Amazon", "Meta", "Apple", "Netflix", "NVIDIA",
+    "Tesla", "OpenAI", "Anthropic", "DeepMind", "Adobe", "Salesforce",
+    "Oracle", "IBM", "Intel", "Qualcomm", "Uber", "Atlassian", "Flipkart",
+    "Swiggy", "Zomato", "Razorpay", "Zoho", "Freshworks", "Walmart",
+    "Goldman Sachs", "JPMorgan", "Morgan Stanley", "Visa", "Mastercard",
+    "Stripe", "Databricks", "Snowflake", "Palantir", "SpaceX", "Samsung",
+    "Sony", "VMware", "Broadcom", "Cisco", "SAP", "Perplexity", "Mistral"
+  ]
+}
