@@ -664,6 +664,22 @@ def main():
     cfg = load_json(BASE / "email.json", {})
     dry = "--no-send" in sys.argv
     force_digest = "--digest" in sys.argv
+    # helper: python scout.py --telegram-id  (print chat ids after you message the bot)
+    if "--telegram-id" in sys.argv:
+        cfg = load_json(BASE / "email.json", {}) or {}
+        token = cfg.get("telegram_bot_token") or input("Paste bot token: ").strip()
+        try:
+            d = get_json(f"https://api.telegram.org/bot{token}/getUpdates")
+            chats = {u.get("message", {}).get("chat", {}).get("id")
+                     for u in d.get("result", []) if u.get("message")}
+            chats.discard(None)
+            if chats:
+                print("Your chat_id(s):", ", ".join(str(c) for c in chats))
+            else:
+                print("No messages found — open your bot in Telegram, press Start, then retry.")
+        except Exception as e:
+            print("Failed:", e)
+        return 0
     if not prof or not cfg:
         log("FATAL: profile.json / email.json missing or invalid")
         return 1
