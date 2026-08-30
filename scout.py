@@ -661,12 +661,14 @@ def digest_tg(items):
 # ------------------------------------------------------------------- main
 def main():
     prof = load_json(BASE / "profile.json", {})
-    cfg = load_json(BASE / "email.json", {})
+    cfg = load_json(BASE / "email.json", {}) or {}
+    for k, v in [("immediate_min_score", 85), ("digest_min_score", 70),
+                 ("stretch_min_score", 60), ("delivery", "auto")]:
+        cfg.setdefault(k, v)
     dry = "--no-send" in sys.argv
     force_digest = "--digest" in sys.argv
     # helper: python scout.py --telegram-id  (print chat ids after you message the bot)
     if "--telegram-id" in sys.argv:
-        cfg = load_json(BASE / "email.json", {}) or {}
         token = cfg.get("telegram_bot_token") or input("Paste bot token: ").strip()
         try:
             d = get_json(f"https://api.telegram.org/bot{token}/getUpdates")
@@ -680,10 +682,11 @@ def main():
         except Exception as e:
             print("Failed:", e)
         return 0
-    if not prof or not cfg:
-        log("FATAL: profile.json / email.json missing or invalid")
+    if not prof:
+        log("FATAL: profile.json missing or invalid")
         return 1
-    # environment overrides (used by GitHub Actions secrets)
+    # environment overrides (used by GitHub Actions secrets; email.json is optional
+    # because on Actions credentials come exclusively from secrets)
     import os
     for env_key, cfg_key in [("GMAIL_USER", "gmail_user"),
                              ("GMAIL_APP_PASSWORD", "gmail_app_password"),
