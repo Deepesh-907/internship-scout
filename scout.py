@@ -576,6 +576,7 @@ def mail_send(cfg, subject, html_body, text_body):
 def deliver(cfg, subject, html_body, text_body):
     mode = cfg.get("delivery", "auto")
     log(f"delivery mode={mode} subject={subject[:60]}")
+    tg_body = "<b>" + esc(subject) + "</b>\n\n" + tg_sanitize(html_body)
     if mode in ("email", "auto"):
         if mail_send(cfg, subject, html_body, text_body):
             return "email"
@@ -584,9 +585,26 @@ def deliver(cfg, subject, html_body, text_body):
         else:
             return None
     if mode in ("telegram", "auto"):
-        if tg_send(cfg, "<b>" + esc(subject) + "</b><br><br>" + html_body):
+        if tg_send(cfg, tg_body):
             return "telegram"
     return None
+
+def tg_sanitize(html_text):
+    """Telegram HTML allows only a small tag set; drop the rest but keep newlines."""
+    allowed = {"b", "i", "u", "s", "a", "code", "pre", "blockquote"}
+    html_text = re.sub(r"(?i)<\s*(br|hr)\s*/?>", "\n", html_text)
+    html_text = re.sub(r"(?i)</?\s*(div|p|table|tr|td|th|ul|ol|li|h[1-6])\s*>",
+                       "\n", html_text)
+    out, pos = [], 0
+    for m in re.finditer(r"</?\s*([a-zA-Z0-9]+)[^>]*>", html_text):
+        tag = m.group(1).lower()
+        if tag not in allowed:
+            out.append(html_text[pos:m.start()])
+            pos = m.end()
+    out.append(html_text[pos:])
+    txt = "".join(out)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
 
 # ------------------------------------------------------------- formatting
 def alert_email(j, sc, reasons, missing, gem):
