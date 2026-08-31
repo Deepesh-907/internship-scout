@@ -860,6 +860,7 @@ def main():
         for k in sorted(seen, key=seen.get)[:1500]:
             seen.pop(k)
     save_json(SEEN_FILE, seen)
+    # a silent exit code keeps the Actions run green; delivery failures are already logged
     log(f"done: seen={len(seen)} alerts={len(to_alert)} digest={len(to_digest)}")
     return 0
 

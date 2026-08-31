@@ -1,4 +1,3 @@
-state/
 logs/
 email.json
 probe_*.py
