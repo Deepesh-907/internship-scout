@@ -146,6 +146,12 @@ def J(src, jid, title, company, loc, url, desc, date=""):
             "location": clean(str(loc)) or "Not specified", "url": url,
             "desc": clean(str(desc))[:4000], "date": (date or "")[:10], "source": src}
 
+# slug -> display name for ATS board companies; populated in main() before feeds run
+_COMPANY_SLUGS = {}
+
+def company_map(slug):
+    return _COMPANY_SLUGS.get(slug.lower(), slug.replace("-", " ").title())
+
 def adp_remotive(p):
     kw = urllib.parse.quote(p["_keyword"])
     d = get_json(f"https://remotive.com/api/remote-jobs?limit=60&category=software-dev&search={kw}")
@@ -527,8 +533,16 @@ def tg_send(cfg, text_html):
             with urllib.request.urlopen(req, timeout=30, context=CTX) as r:
                 resp = json.loads(r.read().decode())
                 if not resp.get("ok"):
-                    log(f"telegram: API said not ok: {str(resp)[:200]}")
+                    log(f"telegram: API said not ok: {str(resp)[:300]}")
                     ok = False
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode()[:300]
+            except Exception:
+                pass
+            log(f"telegram send failed: HTTP {e.code} {detail}")
+            ok = False
         except Exception as e:
             log(f"telegram send failed: {str(e)[:200]}")
             ok = False
@@ -703,12 +717,10 @@ def main():
                              "JuniperNetworks", "adp", "SonyInteractiveEntertainmentGlobal"]
     prof["_gh_companies"] = ["stripe", "databricks", "figma", "cloudflare", "mongodb",
                              "twilio", "robinhood", "reddit", "dropbox", "coinbase",
-                             "doordash", "flexport", "benchling", "nuro", "glean"]
-    prof["_lever_companies"] = ["spotify", "leverdemo", "netflixtech", "kraken", "smartnews",
-                                "esteelauder", "zeuslegion", " Pluto".strip()]
+                             "nuro"]
+    prof["_lever_companies"] = ["spotify"]
     prof["_ashby_companies"] = ["elevenlabs", "Perplexity", "Cohere", "Runway",
-                                "huggingface", "baseten", "modal-labs", "groq",
-                                "deepmind", "mistral", "togetherai"]
+                                "baseten", "groq", "mistral", "togetherai"]
     SLUGS = {}
     for c in prof["_sr_companies"] + prof["_gh_companies"] + prof["_lever_companies"] + prof["_ashby_companies"]:
         SLUGS[c.lower()] = c.replace("-", " ").title()
