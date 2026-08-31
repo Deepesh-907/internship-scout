@@ -422,6 +422,92 @@ def is_target_title(title):
 def word_hit(skill, text):
     return re.search(r"(?<![a-z0-9])" + re.escape(skill.lower()) + r"(?![a-z0-9])", text)
 
+def find_hours(body):
+    """Detect stated weekly hours; returns int or None."""
+    m = re.search(r"(\d{1,2})\s*(?:\+)?\s*(?:hours|hrs|hours/week|hrs/week|hours per week|h/w)", body)
+    if m:
+        h = int(m.group(1))
+        if 5 <= h <= 60:
+            return h
+    if re.search(r"full[- ]?time (?:hours|commitment|basis|basis\b)", body):
+        return 40
+    if re.search(r"\bpart[- ]?time\b", body):
+        return 20
+    return None
+
+def find_duration(body):
+    """Detect internship length in months; returns int or None."""
+    m = re.search(r"(\d{1,2})\s*(?:-|to|–)?\s*(?:months?|mos\b)", body)
+    if m:
+        d = int(m.group(1))
+        if 1 <= d <= 24:
+            return d
+    for word, n in (("one month", 1), ("two months", 2), ("two-month", 2), ("three months", 3),
+                    ("three-month", 3), ("four months", 4), ("four-month", 4),
+                    ("five months", 5), ("five-month", 5), ("six months", 6),
+                    ("six-month", 6), ("year-long", 12), ("1 year", 12), ("2 years", 24)):
+        if word in body:
+            return n
+    return None
+
+def find_stipend(body):
+    """Pull a short salary/stipend snippet if present (skip perk stipends like lunch)."""
+    pats = [r"(?:stipend|salary|compensation|pay(?:ing)?|interns? (?:are |get )?(?:paid|earn))"
+            r"[^.;\n]{0,60}(?:₹|\$|rs\.?|inr|usd)\s?[\d,.]+[kkl]?\s?"
+            r"(?:/?\s?(?:month|mo|yr|year|annum|lpa|pa|hour|hr|week))?",
+            r"(?:₹|\$|rs\.?|inr|usd)\s?[\d,.]+\s?(?:k|lakh|lpa)?\s?"
+            r"(?:per month|/month|monthly|per annum|annually|per hour|/hr)",
+            r"[\d,.]+\s?(?:lpa|lakhs?)(?!\s)",
+            r"\bunpaid\b|not paid"]
+    for p in pats:
+        m = re.search(p, body, re.I)
+        if m:
+            context = body[max(0, m.start() - 40):m.end()]
+            if re.search(r"lunch|meal|commut|travel|relocation|wellness|gym|learning budget",
+                         context, re.I):
+                continue
+            txt = clean(m.group(0))[:70]
+            txt = re.sub(r"^(?:stipend|salary|compensation|pay(?:ing)?|interns? (?:are |get )?(?:paid|earn))"
+                         r"[:\s]*(?:of\s+)?", "", txt, flags=re.I)
+            return txt or None
+    return None
+
+def find_deadline(j):
+    """Application deadline hints: 'apply by <date>' or LinkedIn easy-apply windows."""
+    body = (j.get("desc") or "") + " " + (j.get("title") or "")
+    m = re.search(r"(?:apply by|applications? (?:close|due)|deadline)[:\s]*"
+                  r"(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?"
+                  r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:,?\s+20\d\d)?)",
+                  body, re.I)
+    if m:
+        return clean(m.group(1))
+    return None
+
+def find_joining(j):
+    """Joining/start date hints: cohort year, season+year, or 'starting <date>'."""
+    title = (j.get("title") or "").lower()
+    body = (j.get("desc") or "")[:800].lower()
+    m = re.search(r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|winter|spring|summer|fall|autumn)[a-z]*\.?\s*20\d\d)", title + " " + body)
+    if m:
+        return clean(m.group(1))
+    m = re.search(r"(?:joining|start(?:s|ing)? (?:on|date|from))[:\s]*"
+                  r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+20\d\d)", body)
+    if m:
+        return clean(m.group(1))
+    return None
+
+def find_eligibility(j):
+    """Short eligibility snippet: degree/year/pursuing requirements."""
+    body = j.get("desc") or ""
+    m = re.search(r"(?:to be eligible[^.;\n]{0,40}"
+                  r"|pursuing|enrolled (?:in|with)|currently (?:in|pursuing)|"
+                  r"students?\s+(?:in|pursuing)|"
+                  r"b\.?tech|b\.\s?e\.?\b|b\.?sc\b|bachelor'?s?(?: degree)?|master'?s?(?: s)?|ph\.?d)"
+                  r"[^.|;\n]{0,110}", body, re.I)
+    if m:
+        return clean(m.group(0))[:130]
+    return None
+
 def score_job(j, prof, cfg):
     title = j["title"].lower()
     body = f"{j['title']} {j['desc']} {j['location']}".lower()
@@ -433,6 +519,18 @@ def score_job(j, prof, cfg):
     if any(k in title for k in ("full-time", "full time", "fulltime")) and \
        "intern" not in title and any(k in title for k in FT_TITLE_KEYS):
         is_fulltime = True
+
+    # time commitment: college semester allows 15-20 h/w; 30-40+ must be flagged
+    hours = find_hours(body)
+    if hours is not None:
+        if hours <= 20:
+            score += 6
+            reasons.append(f"{hours} h/week — fits college (you can give ~15-20)")
+        elif hours <= 25:
+            reasons.append(f"{hours} h/week — slightly above your 15-20 h target")
+        else:
+            score -= 10
+            reasons.append(f"⚠ {hours}+ h/week during semester — heavy; decide if feasible")
 
     # 1. role relevance
     role_hits = [r for r in prof["want_roles"]
@@ -473,11 +571,17 @@ def score_job(j, prof, cfg):
     elif "hybrid" in body:
         score += 3
         reasons.append("hybrid arrangement")
-    # 5. duration / semester compatibility
-    if re.search(r"(?:three|four|five|six|[2-6])\s*(?:to\s*[0-9]\s*)?(?:-|to)?\s*(?:months|month)", body) \
-       or re.search(r"\b[3-6]\s*month", body):
-        score += 8
-        reasons.append("3-6 month duration")
+    # 5. duration / semester compatibility (preferred: 1-6 months)
+    dur = find_duration(body)
+    if dur is not None:
+        if 1 <= dur <= 6:
+            score += 8
+            reasons.append(f"{dur}-month duration (your preferred range)")
+        elif dur <= 9:
+            score += 4
+            reasons.append(f"{dur}-month duration — longer than preferred, but may still fit")
+        else:
+            reasons.append(f"⚠ {dur}-month duration — well beyond 6 months; check if semester-compatible")
     if re.search(r"(summer|winter|spring|fall|autumn)\s*(intern|internship|co.?op|2026|2027)", body):
         score += 6
         reasons.append("seasonal internship")
@@ -607,49 +711,73 @@ def tg_sanitize(html_text):
     return txt.strip()
 
 # ------------------------------------------------------------- formatting
-def alert_email(j, sc, reasons, missing, gem):
-    tier = GEM if gem else FIRE
-    miss_html = ""
-    if missing:
-        miss_html = ("<h3 style='margin:14px 0 4px'>Watch out for (missing skills)</h3><ul>" +
-                     "".join(f"<li>⚠️ {esc(m)}</li>" for m in missing[:6]) + "</ul>")
-    why = "".join(f"<li>+ {esc(r)}</li>" for r in reasons)
-    return f"""<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;line-height:1.5">
-  <h2 style="margin:0 0 2px">{tier} Match score {sc}%</h2>
-  <p style="font-size:18px;margin:2px 0 12px"><b>{esc(j['title'])}</b> — <b>{esc(j['company'])}</b></p>
-  <table style="font-size:14px;color:#333">
-    <tr><td style="padding:2px 10px 2px 0"><b>Link</b></td>
-        <td><a href="{esc(j['url'])}">{esc(j['url'][:90])}</a></td></tr>
-    <tr><td style="padding:2px 10px 2px 0"><b>Source</b></td><td>{esc(j['source'])}</td></tr>
-    <tr><td style="padding:2px 10px 2px 0"><b>Location</b></td><td>{esc(j['location'])}</td></tr>
-    <tr><td style="padding:2px 10px 2px 0"><b>Posted</b></td><td>{esc(j.get('date') or 'recent')}</td></tr>
-  </table>
-  <h3 style="margin:14px 0 4px">Why it matches</h3><ul style="font-size:14px">{why}</ul>
-  {miss_html}
-  <p style="font-size:12px;color:#888">You get this because the score is 85+ (immediate-alert tier).
-  Major companies often interview early — apply soon.</p>
-</div>"""
+def job_facts(j):
+    """Extracted card fields for alerts (best-effort from posting text)."""
+    body = f"{j['title']} {j['desc']} {j['location']}".lower()
+    return {
+        "stipend": find_stipend(body),
+        "eligibility": find_eligibility(j),
+        "deadline": find_deadline(j),
+        "joining": find_joining(j),
+        "hours": find_hours(body),
+        "duration": find_duration(body),
+    }
 
 def alert_text(j, sc, reasons, missing, gem):
     tier = GEM if gem else FIRE
-    lines = [f"{tier} [MATCH SCORE {sc}%] — {j['title']} at {j['company']}", "",
-             f"Link:     {j['url']}",
-             f"Source:   {j['source']}   Location: {j['location']}",
-             f"Posted:   {j.get('date') or 'recent'}", "", "WHY IT MATCHES:"]
-    lines += [f"  + {r}" for r in reasons]
+    f = job_facts(j)
+    L = [f"{tier} [{sc}%] {j['title']} at {j['company']}", ""]
+    add = L.append
+    add(f"🏢 {j['company']}")
+    add(f"📍 {j['location']}")
+    add(f"💰 {'Stipend: ' + f['stipend'] if f['stipend'] else 'not stated'}")
+    if f["eligibility"]:
+        add(f"🎓 {f['eligibility']}")
+    if f["deadline"]:
+        add(f"📅 Apply by {f['deadline']}")
+    if f["joining"]:
+        add(f"🚀 Joins {f['joining']}")
+    if f["duration"]:
+        add(f"⏱ {f['duration']}-month duration")
+    if f["hours"]:
+        add(f"⏰ {f['hours']} h/week")
+    add(f"⭐ Match score {sc}%")
+    add(f"👉 {j['url']}")
+    add("")
+    add("WHY: " + "; ".join(reasons[:5]))
     if missing:
-        lines += ["", "MISSING SKILLS:"] + [f"  - {m}" for m in missing[:6]]
-    return "\n".join(lines)
+        add("MISSING SKILLS: " + ", ".join(missing[:5]))
+    return "\n".join(L)
 
-def alert_tg(j, sc, reasons, missing, gem):
+def alert_email(j, sc, reasons, missing, gem):
+    """HTML twin of alert_text for the email channel."""
     tier = GEM if gem else FIRE
-    s = f"<b>{tier} [{sc}%] {esc(j['title'])}</b>\n<b>{esc(j['company'])}</b>\n\n" \
-        f"<a href=\"{esc(j['url'])}\">Open posting</a>\n" \
-        f"<i>{esc(j['source'])} · {esc(j['location'])}</i>\n\n" \
-        + "\n".join(f"+ {esc(r)}" for r in reasons)
-    if missing:
-        s += "\n\n" + "\n".join(f"⚠️ missing: {esc(m)}" for m in missing[:5])
-    return s
+    f = job_facts(j)
+    rows = [(f"🔥 {esc(j['title'])}", ""),
+            ("🏢", esc(j["company"])),
+            ("📍", esc(j["location"])),
+            ("💰", esc(f["stipend"] or "not stated")),
+            ("🎓", esc(f["eligibility"] or "—")),
+            ("📅", esc(("Apply by " + f["deadline"]) if f["deadline"] else "—")),
+            ("🚀", esc(f["joining"] or "stated in posting")),
+            ("⏱", esc(f"{f['duration']}-month" if f["duration"] else "—")),
+            ("⏰", esc(f"{f['hours']} h/week" if f["hours"] else "—")),
+            (f"⭐", f"<b>Match score {sc}%</b>"),
+            ("👉", f"<a href=\"{esc(j['url'])}\">Direct application</a>")]
+    table = "".join(f"<tr><td style='padding:2px 12px 2px 0;font-size:15px'>{k}</td>"
+                    f"<td style='font-size:15px'>{v}</td></tr>" for k, v in rows if v != "")
+    why = "".join(f"<li>+ {esc(r)}</li>" for r in reasons[:5])
+    mis = ("".join(f"<li>⚠️ {esc(m)}</li>" for m in missing[:5]) and
+           f"<b>Missing skills:</b><ul>{''.join(f'<li>⚠️ {esc(m)}</li>' for m in missing[:5])}</ul>") \
+          if missing else ""
+    return f"""<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;line-height:1.5">
+  <h2 style="margin:0 0 8px">{tier} Match score {sc}%</h2>
+  <table style="color:#222">{table}</table>
+  <h3 style="margin:12px 0 4px">Why it matches</h3><ul>{why}</ul>
+  {mis}
+  <p style="font-size:12px;color:#888">Score 85+ → immediate alert. Major companies hire months
+  ahead — apply early.</p>
+</div>"""
 
 def digest_email(items):
     out = []
@@ -672,7 +800,7 @@ def digest_text(items):
     blocks = []
     for sc, j, reasons, missing in items:
         tier = STRT if sc < 70 else GOOD
-        b = f"{tier} [{sc}%] {j['title']} — {j['company']}\n   {j['location']} ({j['source']})\n   {j['url']}\n   + " + "; ".join(reasons[:4])
+        b = f"{tier} [{sc}%] {j['title']} — {j['company']}\n   📍 {j['location']}\n   👉 {j['url']}\n   " + "; ".join(reasons[:4])
         if missing:
             b += "\n   Missing: " + ", ".join(missing[:5])
         blocks.append(b)
