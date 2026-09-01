@@ -8,8 +8,8 @@ scores them against profile.json, and delivers:
   60-69  -> digest as "Stretch Match" with missing skills
   < 60   -> silent, except rare major-company exception (flagged with a reason)
 
-Delivery: email (Gmail app password) and/or Telegram bot. If the primary channel
-fails, the other one is used automatically (delivery: "auto").
+Delivery: Telegram bot only (scoring tiers and email removed by request;
+the score is a guide, not a filter — every relevant job is delivered).
 
 Zero third-party dependencies. Python 3.8+.
 
@@ -18,9 +18,6 @@ Zero third-party dependencies. Python 3.8+.
   python scout.py --digest    # force the digest to be sent this run
 """
 import json, re, ssl, sys, time, urllib.request, urllib.error, urllib.parse
-import smtplib, html as html_mod
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -878,7 +875,7 @@ def score_job(j, prof, cfg):
 
 # --------------------------------------------------------------- delivery
 def esc(s):
-    return html_mod.escape(s or "")
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def tg_send(cfg, text_html):
     token, chat = cfg.get("telegram_bot_token"), cfg.get("telegram_chat_id")
@@ -911,45 +908,11 @@ def tg_send(cfg, text_html):
             ok = False
     return ok
 
-def mail_send(cfg, subject, html_body, text_body):
-    user, pwd = cfg.get("gmail_user"), cfg.get("gmail_app_password")
-    to = cfg.get("notify_email") or user
-    if not user or not pwd or not to:
-        log("email not sent: missing gmail_user / gmail_app_password / notify_email")
-        return False
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = user
-    msg["To"] = to
-    if cfg.get("cc_emails"):
-        msg["Cc"] = ", ".join(cfg["cc_emails"])
-    msg.attach(MIMEText(text_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-    recipients = [to] + list(cfg.get("cc_emails") or [])
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=CTX, timeout=30) as s:
-            s.login(user, pwd)
-            s.sendmail(user, recipients, msg.as_string())
-        log(f"EMAIL SENT -> {to} :: {subject}")
-        return True
-    except Exception as e:
-        log(f"EMAIL FAILED: {str(e)[:250]}")
-        return False
-
 def deliver(cfg, subject, html_body, text_body):
-    mode = cfg.get("delivery", "auto")
-    log(f"delivery mode={mode} subject={subject[:60]}")
+    """Telegram-only delivery. Scoring tiers and email are gone by user request."""
     tg_body = "<b>" + esc(subject) + "</b>\n\n" + tg_sanitize(html_body)
-    if mode in ("email", "auto"):
-        if mail_send(cfg, subject, html_body, text_body):
-            return "email"
-        if mode == "auto":
-            log("email failed -> falling back to Telegram")
-        else:
-            return None
-    if mode in ("telegram", "auto"):
-        if tg_send(cfg, tg_body):
-            return "telegram"
+    if tg_send(cfg, tg_body):
+        return "telegram"
     return None
 
 def tg_sanitize(html_text):
@@ -1171,10 +1134,9 @@ def digest_tg(items):
 # ------------------------------------------------------------------- main
 def main():
     prof = load_json(BASE / "profile.json", {})
-    cfg = load_json(BASE / "email.json", {}) or {}
-    for k, v in [("immediate_min_score", 85), ("digest_min_score", 70),
-                 ("stretch_min_score", 60), ("delivery", "auto")]:
-        cfg.setdefault(k, v)
+    cfg = load_json(BASE / "telegram.json", {}) or {}  # legacy email.json also still works
+    if not cfg.get("telegram_bot_token") or not cfg.get("telegram_chat_id"):
+        cfg = load_json(BASE / "email.json", {}) or {}
     dry = "--no-send" in sys.argv
     force_digest = "--digest" in sys.argv
     # helper: python scout.py --telegram-id  (print chat ids after you message the bot)
@@ -1195,15 +1157,10 @@ def main():
     if not prof:
         log("FATAL: profile.json missing or invalid")
         return 1
-    # environment overrides (used by GitHub Actions secrets; email.json is optional
-    # because on Actions credentials come exclusively from secrets)
+    # environment overrides (Telegram bot only)
     import os
-    for env_key, cfg_key in [("GMAIL_USER", "gmail_user"),
-                             ("GMAIL_APP_PASSWORD", "gmail_app_password"),
-                             ("NOTIFY_EMAIL", "notify_email"),
-                             ("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
-                             ("TELEGRAM_CHAT_ID", "telegram_chat_id"),
-                             ("DELIVERY", "delivery")]:
+    for env_key, cfg_key in [("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
+                             ("TELEGRAM_CHAT_ID", "telegram_chat_id")]:
         if os.environ.get(env_key):
             cfg[cfg_key] = os.environ[env_key]
 
@@ -1249,10 +1206,10 @@ def main():
         time.sleep(1.2)
     save_json(ERR_FILE, src_err)
 
-    # de-dup + filter + score
+    # de-dup + score (no score-based filter; every relevant job is delivered)
     seen_ids, scored = [], []
     now_iso = time.strftime("%Y-%m-%d %H:%M")
-    n_hard = n_qual = 0
+    n_qual = n_hard = 0
     # cross-source dedup: company+role (normalized) is the same opportunity.
     # prefer official ATS/company URLs over aggregator copies.
     def dedup_key(j):
@@ -1280,95 +1237,67 @@ def main():
             continue
         by_key[k] = j
     for j in by_key.values():
-        # STEP 11 quality gate: scams / unidentifiable companies / stale listings
+        # Scams/clearly-fake filter only — scoring is informational, never a rejecter.
+        # PhD-only / 2026-batch / work-auth requirements are shown with a HARD-ELIGIBILITY
+        # tag so the user can decide; they're not dropped.
         q = quality_check(j, prof)
         if q:
             n_qual += 1
-            continue
-        # STEP 4-6 hard eligibility gate
-        hv = hard_eligibility(j, prof)
-        if hv:
-            n_hard += 1
             continue
         sc, reasons, missing, is_ft = score_job(j, prof, cfg)
         if sc <= 0:
             continue
         j["_ft"] = is_ft
-        scored.append((sc, j, reasons, missing))
-    scored.sort(key=lambda x: -x[0])
-    log(f"scored {len(scored)} relevant of {len(all_jobs)} raw "
-        f"(blocked: {n_hard} hard-eligibility, {n_qual} quality/scam/dup)")
-
-    fire, digest, stretch = [], [], []
-    for sc, j, reasons, missing in scored:
+        # surface hard-eligibility as a tag (still delivered)
+        hv = hard_eligibility(j, prof)
+        if hv:
+            reasons = hv + reasons
+        # full-time joining-date rule
         if j["_ft"]:
             joining = find_joining(j)
             if joining:
-                # explicit date: compare against fulltime_available_from (2026-12-15)
                 if re.search(r"20(?:2[7-9]|[6][6-9])", joining) or \
                    re.search(r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|winter|spring)[a-z]*\.?\s*2027", joining):
                     reasons.append(f"joining {joining} — on/after 15 Dec 2026 (OK)")
                 elif re.search(r"dec[a-z]*\.?\s*2026", joining):
                     reasons.append(f"joining {joining} — December 2026; verify it's on/after 15 Dec")
                 else:
-                    # a 2026 (or earlier) start we can't confirm is >= 15 Dec 2026
                     reasons.append(f"⚠ joining {joining} looks BEFORE your 15 Dec 2026 availability")
-                    continue
             else:
-                # unknown joining date: report with a verify flag, never silently drop
                 reasons.append("⚠️ Joining date unclear — verify before applying")
-        if sc >= cfg["immediate_min_score"]:
-            fire.append((sc, j, reasons, missing))
-        elif sc >= cfg["digest_min_score"]:
-            digest.append((sc, j, reasons, missing))
-        elif sc >= cfg["stretch_min_score"]:
-            stretch.append((sc, j, reasons, missing))
-        else:
-            major = any(c.lower() in j["company"].lower() or c.lower() == j["source"]
-                        for c in prof["major_companies"])
-            preferred = {"aws", "docker", "kubernetes", "spark", "kafka", "golang",
-                         "rust", "scala", "langchain", "mlops", "airflow"}
-            if major and sc >= 50 and missing and set(m.lower() for m in missing) <= preferred:
-                fire.append((sc, j, reasons + ["exception: major company, gaps are only "
-                            "in preferred (not mandatory) tech"], missing))
+        scored.append((sc, j, reasons, missing))
+    scored.sort(key=lambda x: -x[0])
+    log(f"scored {len(scored)} relevant of {len(all_jobs)} raw "
+        f"(blocked: {n_qual} scam/fake; {n_hard} other)")
 
-    fire = fire[:6]
-    digest_items = digest[:15]
-    stretch_items = stretch[:15]
-    to_alert = [x for x in fire if x[1]["id"] not in seen]
-    to_digest = [x for x in (digest_items + stretch_items) if x[1]["id"] not in seen]
-
-    log(f"to-alert={len(to_alert)} to-digest={len(to_digest)}")
+    # No score-tier splitting: every fresh job goes in one Telegram digest.
+    to_send = [x for x in scored if x[1]["id"] not in seen]
+    log(f"to-send={len(to_send)}")
 
     if dry:
         print("\n===== DRY RUN — what would be delivered =====")
-        for sc, j, r, m in to_alert:
+        for sc, j, r, m in to_send:
             print(alert_text(j, sc, r, m))
             print("-" * 70)
-        if to_digest:
-            print("DIGEST:")
-            print(digest_text(to_digest[:20]))
-        if not (to_alert or to_digest):
+        if not to_send:
             print("(nothing new)")
         return 0
 
-    sent = []
-    for sc, j, r, m in to_alert:
-        subject = f"🔥 [{sc}%] Match — {j['title']} at {j['company']}"
-        via = deliver(cfg, subject, alert_email(j, sc, r, m),
-                      alert_text(j, sc, r, m))
-        if via:
-            sent.append(via)
-            seen[j["id"]] = now_iso
-        time.sleep(1.5)
-
-    if to_digest and (force_digest or not to_alert or sent):
-        subject = f"🟢 Internship Digest — {len(to_digest[:20])} new matches ({now_iso})"
-        via = deliver(cfg, subject, digest_email(to_digest[:20]),
-                      digest_text(to_digest[:20]))
-        if via:
-            for sc, j, r, m in to_digest:
-                seen[j["id"]] = now_iso
+    sent = 0
+    if to_send:
+        # split into Telegram-sized chunks; each chunk is one Telegram message
+        BATCH = 4
+        for i in range(0, len(to_send), BATCH):
+            chunk = to_send[i:i + BATCH]
+            chunk_subject = (f"🟢 {len(to_send)} new opportunities ({now_iso})"
+                             if i == 0 else f"  ...continued ({i+1}-{i+len(chunk)} of {len(to_send)})")
+            chunk_text = "\n\n---\n\n".join(alert_text(j, sc, r, m) for sc, j, r, m in chunk)
+            via = deliver(cfg, chunk_subject, "", chunk_text)
+            if via:
+                sent += len(chunk)
+                for sc, j, r, m in chunk:
+                    seen[j["id"]] = now_iso
+        log(f"delivered {sent} opportunities")
 
     if len(seen) > 5000:
         for k in sorted(seen, key=seen.get)[:1500]:
