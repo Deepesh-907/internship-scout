@@ -594,143 +594,287 @@ def find_eligibility(j):
         return clean(m.group(0))[:130]
     return None
 
-def score_job(j, prof, cfg):
+# ------------------------------------------------------------- eligibility
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+def parse_date_any(s):
+    """Parse '15-10-2026', 'Oct 15, 2026', '15 Oct 2026' -> date or None."""
+    import datetime as dt
+    s = (s or "").strip().lower()
+    m = re.search(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", s)
+    if m:
+        d, mo = int(m.group(1)), int(m.group(2))
+        y = int(m.group(3)) if m.group(3) else None
+        if y and y < 100:
+            y += 2000
+        if y and 1 <= mo <= 12 and 1 <= d <= 31:
+            try:
+                return dt.date(y, mo, d)
+            except ValueError:
+                pass
+    m = re.search(r"([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,)?\s*(\d{4})?", s)
+    if m and m.group(1) in MONTHS:
+        d = int(m.group(2))
+        y = int(m.group(3)) if m.group(3) else None
+        if y and 1 <= d <= 31:
+            import datetime as dt
+            try:
+                return dt.date(y, MONTHS[m.group(1)], d)
+            except ValueError:
+                pass
+    return None
+
+def hard_eligibility(j, prof):
+    """Return list of HARD eligibility violations (empty = eligible).
+    Only counts REQUIRED wording, not preferred/nice-to-have."""
+    import datetime as dt
     title = j["title"].lower()
-    body = f"{j['title']} {j['desc']} {j['location']}".lower()
-    score = 45.0
+    desc = (j.get("desc") or "")[:6000].lower()
+    body = f"{title} {desc}"
+    v = []
+
+    # 1. degree requirements (BCA = bachelor's; can't satisfy master's/phd-only)
+    if re.search(r"(?:require|must have|requires)[^.]{0,60}\b(master'?s(?: degree)?|m\.?tech|ph\.?d|msc\b)[^.]{0,40}\b(degree|in\b)", body) \
+       or re.search(r"\b(master'?s degree|ph\.?d|msc|m\.?tech)\s+(?:is )?(?:required|mandatory|must)\b", body) \
+       or re.search(r"^(?:requirements?|minimum qualifications?)[\s\S]{0,200}?(?:master'|ph\.?d)", desc, re.M):
+        if "bca" not in body and "bachelor" not in body and "any degree" not in body \
+           and "or equivalent" not in body and "currently pursuing" not in body:
+            v.append("❌ HARD ELIGIBILITY ISSUE: requires Master's/PhD — you are a BCA undergraduate")
+
+    # 2. experience requirements
+    m = re.search(r"(\d{1,2})\+?\s*(?:-\s*\d{1,2}\s*)?(?:years?|yrs?)\s*(?:of\s*)?(?:professional\s*)?experience", body)
+    if m:
+        yrs = int(m.group(1))
+        if yrs >= 2 and not re.search(r"(?:years? of college|years? of university|years? of education)", body):
+            v.append(f"❌ HARD ELIGIBILITY ISSUE: requires {yrs}+ years experience — you are a fresher")
+        elif yrs == 1 and re.search(r"(?:require|must have|minimum)", body[:m.start()][-60:]):
+            v.append("⚠ 1 year experience required — borderline for a fresher")
+
+    # 3. graduation year cohort restrictions (2026-only batches exclude a 2027 grad)
+    m = re.search(r"\b20(2[4-6])\b\s*(?:batch|graduates?|passing out|passout)", body)
+    if m and "2027" not in body:
+        v.append(f"❌ HARD ELIGIBILITY ISSUE: restricted to 20{m.group(1)} batch — you graduate 2027")
+
+    # 4. work authorization for onsite abroad
+    if re.search(r"\bmust be (?:authorized|eligible) to work in (?:the )?(?:us|uk|canada|eu|germany|singapore)\b", body) \
+       or re.search(r"\b(?:us|uk|canadian|eu) (?:citizens?|citizenship|work authorization) (?:required|only)\b", body):
+        v.append("❌ HARD ELIGIBILITY ISSUE: requires work authorization you don't hold")
+
+    # 5. immediate full-time joining before 15 Dec 2026
+    if j.get("_ft"):
+        joining = find_joining(j)
+        if joining:
+            d = parse_date_any(joining)
+            if d and d < dt.date(2026, 12, 15):
+                v.append(f"❌ HARD ELIGIBILITY ISSUE: joining {joining} is before your 15 Dec 2026 availability")
+
+    return v
+
+def quality_check(j, prof):
+    """Scam / fake / expired listing detection. Returns list of issues."""
+    t = j["title"].lower()
+    body = f"{j['title']} {j.get('desc') or ''}".lower()
+    loc = (j.get("location") or "").lower()
+    issues = []
+
+    # scam patterns
+    scam_t = ("earn money online", "data entry", "form filling", "typing job",
+              "copy paste", "make money", "work from home job", "investment",
+              "insurance agent", "mlm", "network marketing", "bitcoin", "crypto trading",
+              "clicking", "captchas", "registration fee", "earn daily", "earn 500",
+              "earn ₹", "earn rs", "paid training", "training fee", "security deposit")
+    if any(k in t for k in scam_t) and not any(k in t for k in ("ai", "ml", "machine learning", "developer", "engineer", "python")):
+        issues.append("scam-pattern title")
+    if any(k in body for k in ("registration fee", "security deposit", "training fee",
+                               "pay to apply", "refundable fee", "processing fee",
+                               "deposit of", "pay rs", "pay ₹")):
+        issues.append("pay-to-apply scheme")
+    if any(k in body for k in ("commission only", "commission-only", "no fixed salary")):
+        issues.append("commission-only role")
+    if re.search(r"earn\s+(?:up to\s*)?(?:₹|rs\.?|inr)?\s*[\d,]+\s*(?:per|/)\s*(?:day|week|task|assignment)", body):
+        issues.append("earn-per-task scheme")
+    if re.search(r"training program[^.]{0,50}(?:fee|charge|paid)|paid training program", body):
+        issues.append("training program disguised as job")
+
+    # company identifiable
+    comp = (j.get("company") or "").strip()
+    if not comp or comp in ("?", "unknown", "confidential company", "private limited 123",
+                            "wellfound startup", "indeed employer", "linkedin employer") or len(comp) < 2:
+        issues.append("company not identifiable")
+
+    # obviously stale posting
+    date_s = j.get("date") or ""
+    if date_s:
+        try:
+            import datetime as dt
+            age = (dt.datetime.now(dt.timezone.utc).date() - dt.date.fromisoformat(date_s[:10])).days
+            if age > 120:
+                issues.append(f"posted {age} days ago — likely expired")
+        except ValueError:
+            pass
+
+    # clearly fake company names
+    if re.search(r"\b(consultancy|hr services)\b", comp.lower()) and "recruitment" in body and "software" not in body:
+        pass  # consultancy postings can be real; skip hard block
+
+    return issues
+
+# ---------------------------------------------------- new resume match score
+def score_job(j, prof, cfg):
+    """Honest 0-100 resume match: required 35 + preferred 15 + education 15 +
+    projects 15 + experience 10 + role relevance 10."""
+    title = j["title"].lower()
+    desc = (j.get("desc") or "")
+    body = f"{j['title']} {desc} {j['location']}".lower()
     reasons = []
     missing = []
-    # full-time detection (early-career only; plain senior FT filtered by title)
-    is_fulltime = False
-    if any(k in title for k in ("full-time", "full time", "fulltime")) and \
-       "intern" not in title and any(k in title for k in FT_TITLE_KEYS):
-        is_fulltime = True
+    breakdown = {}
 
-    # time commitment: college semester allows 15-20 h/w; 30-40+ must be flagged
+    # ---- required skills (35)
+    # split JD into requirement-ish segments; treat tech named there as 'required'
+    req_text = " ".join(re.findall(
+        r"(?:requirements?|require|must have|mandatory|minimum qualifications?|"
+        r"what you['\u2019]?ll (?:do|need)|qualification)[\s\S]{0,400}?(?:\.\s[A-Z]|;|$)", desc, re.I))
+    if not req_text:
+        # 'python, pandas required' / 'requires python' styles
+        req_text = " ".join(re.findall(r"[\s\S]{0,200}?(?:require[ds]?|mandatory|must have)[\s\S]{0,80}", desc, re.I))
+    if not req_text:
+        req_text = desc  # can't isolate requirements: use full JD as proxy
+    req_blob = req_text.lower()
+    have = [s.lower() for s in prof.get("have_skills", [])]
+    have_hits = [s for s in have if word_hit(s, req_blob)]
+    tech_present = [s for s in (prof.get("have_skills", []) + prof.get("missing_skills", []))
+                    if word_hit(s.lower(), body)]
+    # ratio of your skills among the technologies the JD actually names
+    if tech_present:
+        req_ratio = len(have_hits) / max(1, len(tech_present))
+    else:
+        req_ratio = 0.6  # JD names nothing specific: neutral
+    breakdown["required"] = round(35 * req_ratio)
+    if have_hits:
+        reasons.append(f"required skills matched: {', '.join(have_hits[:6])}")
+
+    # ---- preferred skills (15)
+    pref_blob = " ".join(re.findall(
+        r"(?:preferred|nice[- ]to[- ]have|bonus|plus|good to have)[\s\S]{0,300}?(?:\.|$)",
+        desc, re.I)).lower()
+    if pref_blob:
+        pref_hits = [s for s in have if word_hit(s, pref_blob)]
+        breakdown["preferred"] = round(15 * len(pref_hits) / max(1, len(pref_hits) + 2))
+        if pref_hits:
+            reasons.append(f"preferred skills you have: {', '.join(pref_hits[:4])}")
+    else:
+        breakdown["preferred"] = 7  # nothing stated as preferred: neutral
+        missing = [s.title() for s in prof.get("missing_skills", []) if word_hit(s, body)]
+
+    # missing skills = JD-named tech you don't have
+    missing = [s.title() for s in prof.get("missing_skills", [])
+               if word_hit(s, body)] or missing
+
+    # ---- education & eligibility (15)
+    edu = 0
+    if any(k in body for k in ("bca", "bca students", "any graduate", "any degree",
+                               "bachelor", "bca/btech", "bca/ bsc")):
+        edu += 6
+    if any(k in body for k in ("fresher", "student", "pursuing", "no experience",
+                               "0-1 years", "entry level", "entry-level")):
+        edu += 5
+    if "intern" in title or "internship" in title:
+        edu += 4
+    elif any(k in title for k in ("fresher", "graduate", "campus", "new grad", "university", "trainee")):
+        edu += 4
+    breakdown["education"] = min(15, edu)
+
+    # ---- projects (15): overlap of JD stack with my two projects
+    proj_stacks = []
+    for p in prof.get("projects", []):
+        proj_stacks += [s.lower() for s in p.get("stack", [])]
+    proj_hits = [s for s in set(proj_stacks) if word_hit(s, body)]
+    if proj_hits:
+        breakdown["projects"] = min(15, 5 + 4 * len(set(proj_hits)))
+        reasons.append(f"project stack overlap: {', '.join(sorted(set(proj_hits))[:5])}")
+    else:
+        breakdown["projects"] = 2
+
+    # ---- practical experience (10)
+    exp = 0
+    if word_hit("fastapi", body) or word_hit("rest api", body):
+        exp += 3
+        reasons.append("your FastAPI/REST project maps directly")
+    if word_hit("scikit-learn", body) or word_hit("pandas", body) or word_hit("numpy", body):
+        exp += 3
+        reasons.append("your ML/data workflow experience applies")
+    if any(k in body for k in ("collaborat", "team", "agile", "cross-functional")):
+        exp += 2
+    if any(k in body for k in ("event", "workshop", "volunteer")):
+        exp += 1
+    breakdown["experience"] = min(10, exp)
+
+    # ---- role relevance (10)
+    want = [r.lower() for r in prof.get("want_roles", [])]
+    role_hit = None
+    for r in want:
+        words = [w for w in re.split(r"[\s/]+", r) if len(w) > 2]
+        if words and all(w in title for w in words[:2]):
+            role_hit = r
+            break
+    if role_hit:
+        breakdown["role"] = 10
+        reasons.append(f"target role: {role_hit}")
+    elif any(k in title for k in ("ai", "ml", "machine learning", "data scien", "deep learning",
+                                  "nlp", "genai", "llm", "computer vision")):
+        breakdown["role"] = 8
+        reasons.append("AI/ML-adjacent role")
+    elif any(k in title for k in ("software", "developer", "engineer", "sde", "backend", "python")):
+        breakdown["role"] = 7
+        reasons.append("software/engineering role in your direction")
+    else:
+        breakdown["role"] = 3
+
+    # ---- context adjustments (small, honest, explained)
+    adj = 0
+    if "remote" in body or "work from home" in body:
+        adj += 2
+    if re.search(r"noida|greater noida|delhi ncr|\bncr\b|gurugram|gurgaon|\bdelhi\b", body):
+        adj += 2
+        reasons.append("Noida/Delhi NCR — your home zone")
+    if any(c.lower() in j["company"].lower() for c in prof.get("major_companies", [])):
+        adj += 1
+        reasons.append("major company")
+    # early-hiring flag (no score inflation; it's a reporting priority)
+    if re.search(r"\b202[7-9]\b", title + " " + body[:300]):
+        reasons.append("🎯 early hiring — applications open now for a future joining date")
+
+    # hours/week: college semester allows 15-20; heavier must be flagged not hidden
     hours = find_hours(body)
     if hours is not None:
         if hours <= 20:
-            score += 6
             reasons.append(f"{hours} h/week — fits college (you can give ~15-20)")
         elif hours <= 25:
             reasons.append(f"{hours} h/week — slightly above your 15-20 h target")
         else:
-            score -= 10
             reasons.append(f"⚠ {hours}+ h/week during semester — heavy; decide if feasible")
+    score = max(0, min(100, sum(breakdown.values()) + adj))
 
-    # 1. role relevance
-    role_hits = [r for r in prof["want_roles"]
-                 if all(w in title or w in body[:120] for w in re.split(r"[\s/]+", r.lower()))]
-    ai_role = any(k in title for k in ("ai", "machine learning", " ml", "ml ", "data scien",
-                                       "deep learning", "nlp", "computer vision", "genai", "llm"))
-    if ai_role:
-        # generic 'ai' word inside a non-technical title is not an AI/ML role
-        if "ai" in title and not any(k in title for k in ("engineer", "developer", "intern",
-                                    "scientist", "research", "ml", "machine learning",
-                                    "data scien", "nlp", "vision", "genai", "llm", "technical")):
-            ai_role = False
-    if ai_role:
-        score += 18
-        reasons.append("AI/ML/data role")
-    elif role_hits:
-        score += 12
-        reasons.append(f"target role: {role_hits[0]}")
-    else:
-        if "engineer" not in title and "developer" not in title and "analyst" not in title \
-           and "scientist" not in title and "sde" not in title:
-            return 0, [], [], False
-        score += 6
-        reasons.append("software/engineering role")
-    # 2. intern/entry
-    if any(k in title for k in ("intern", "internship", "trainee", "co-op", "apprentice")):
-        score += 10
-        reasons.append("internship position")
-    elif any(k in title for k in ("fresher", "graduate", "campus", "new grad", "university",
-                                  "early career")) or is_fulltime:
-        score += 5
-        reasons.append("entry-level / early-career role")
-    # 3. skills
-    have_hits = [s for s in prof["have_skills"] if word_hit(s, body)]
-    missing = [s for s in prof["missing_skills"] if word_hit(s, body)]
-    cov = len(have_hits) / max(1, len(prof["have_skills"]))
-    score += min(20, round(40 * cov))
-    if have_hits:
-        reasons.append(f"skills: {', '.join(have_hits[:5])}")
-    # 4. remote / flexible
-    if "remote" in body or "work from home" in body or "wfh" in body:
-        score += 8
-        reasons.append("remote friendly")
-    elif "hybrid" in body:
-        score += 3
-        reasons.append("hybrid arrangement")
-    # 5. duration / semester compatibility (preferred: 1-6 months)
-    dur = find_duration(body)
-    if dur is not None:
-        if 1 <= dur <= 6:
-            score += 8
-            reasons.append(f"{dur}-month duration (your preferred range)")
-        elif dur <= 9:
-            score += 4
-            reasons.append(f"{dur}-month duration — longer than preferred, but may still fit")
-        else:
-            reasons.append(f"⚠ {dur}-month duration — well beyond 6 months; check if semester-compatible")
-    if re.search(r"(summer|winter|spring|fall|autumn)\s*(intern|internship|co.?op|2026|2027)", body):
-        score += 6
-        reasons.append("seasonal internship")
-    if re.search(r"\bflexible\b|\bflex hours\b|own pace|self-paced", body):
-        score += 2
-    # 6. paid / unpaid
-    unpaid = False
-    if re.search(r"\bunpaid\b|without stipend|no stipend|non[- ]paid", body):
-        unpaid = True
+    # full-time detection for downstream joining-date rule
+    is_fulltime = False
+    if any(k in title for k in ("full-time", "full time", "fulltime")) and \
+       "intern" not in title and any(k in title for k in FT_TITLE_KEYS):
+        is_fulltime = True
+    # fresher/graduate full-time without the literal words still counts
+    if not is_fulltime and "intern" not in title and \
+       any(k in title for k in ("fresher", "graduate software", "graduate engineer",
+                                "2027", "graduate trainee", "campus hire", "new grad")):
+        is_fulltime = True
+
+    # unpaid labeling
+    if re.search(r"\bunpaid\b|without stipend|no stipend", body):
         reasons.append("⚠ UNPAID internship")
-    elif re.search(r"\bstipend\b|paid internship|\$\d|₹\d|usd \d|per month|lpa|salary", body):
-        score += 4
-        reasons.append("paid / stipend mentioned")
-    # 7. location relevance (NCR home zone > India > remote-india > intl remote)
-    if re.search(r"\bnoida\b|greater noida|delhi ncr|\bncr\b|\bgurgaon\b|\bgurugram\b|\bdelhi\b", body):
-        score += 8
-        reasons.append("Noida/Delhi NCR — your home zone")
-    elif re.search(r"\bindia\b|bengaluru|bangalore|hyderabad|pune|mumbai|chennai|kolkata|ahmedabad|jaipur|indore", body):
-        score += 4
-        if "remote" in body and re.search(r"\bindia\b", body):
-            score += 2
-            reasons.append("remote (India-eligible)")
-    else:
-        if "remote" in body and not re.search(r"\bus only\b|u\.s\. only|canada only|uk only|eu only|"
-                                              r"authorized to work in (?:the )?(?:us|uk|canada|eu)|"
-                                              r"must be (?:located|based) in (?:the )?(?:us|uk|canada)", body):
-            score += 3
-            reasons.append("international remote — check India eligibility")
-        else:
-            # onsite abroad with no India mention: low priority for a BCA student in Noida
-            score -= 12
-            reasons.append("⚠ onsite abroad — likely needs work authorization you don't have")
-    # 8. major company
-    major = any(c.lower() in j["company"].lower() or c.lower() == j.get("source", "")
-                for c in prof["major_companies"])
-    if major:
-        score += 6
-        reasons.append("major company")
-    # 9. freshness
-    if j.get("date"):
-        try:
-            import datetime as dt
-            age = (dt.datetime.now(dt.timezone.utc).date() - dt.date.fromisoformat(j["date"][:10])).days
-            if age <= 2:
-                score += 5
-                reasons.append("posted in last 2 days")
-            elif age <= 7:
-                score += 3
-            elif age > 45:
-                score -= 10
-        except ValueError:
-            pass
-    score = max(0, min(100, round(score)))
-    # unpaid rule: only worth it if the rest is unusually strong
-    if unpaid and score < 75:
-        return 0, [], [], False
+
     return score, reasons, missing, is_fulltime
+
+
 
 # --------------------------------------------------------------- delivery
 def esc(s):
@@ -838,60 +982,151 @@ def job_facts(j):
         "duration": find_duration(body),
     }
 
-def alert_text(j, sc, reasons, missing, gem):
-    tier = GEM if gem else FIRE
+def summarize_jd(j):
+    """3-6 line JD summary: what you'd work on, tech, expectations. Never copy huge chunks."""
+    d = (j.get("desc") or "").strip()
+    if not d:
+        return "Not disclosed"
+    # first meaningful sentences, skipping boilerplate headings
+    d = re.sub(r"(?i)^(?:about (?:us|the company|the role)|job description|requirements?|"
+               r"responsibilities?|who (?:we|you) (?:are|'re)|overview|role)\s*:?\s*", "", d)
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean(d)) if len(s.strip()) > 25]
+    pick, total = [], 0
+    for s in sents:
+        if total > 420:
+            break
+        pick.append(s)
+        total += len(s)
+    return " ".join(pick)[:520] or "Not disclosed"
+
+def extract_responsibilities(j, n=3):
+    """Pull up to n responsibility bullets from the JD."""
+    d = j.get("desc") or ""
+    seg = " ".join(re.findall(r"(?:responsibilit(?:y|ies)|what you['\u2019]?ll (?:do|work on)|"
+                              r"you will|your day(?: to day)?|key (?:duties|tasks))[\s\S]{0,700}", d, re.I))
+    if not seg:
+        seg = d
+    # bullet-ish sentences with verbs
+    verbs = ("build", "develop", "design", "create", "work", "maintain", "write", "test",
+             "train", "analyze", "deploy", "collaborate", "implement", "research", "support",
+             "optimize", "integrate", "build", "participate", "contribute")
+    out = []
+    for s in re.split(r"(?:<li[^>]*>|\n|;\s|(?<=[.!?])\s+)", clean(seg)):
+        s = s.strip(" -•\u2022\t")
+        s = re.sub(r"^(?:what you['\u2019]?ll (?:do|work on)|responsibilit(?:y|ies)|"
+                   r"key (?:duties|tasks)|you will|your day(?: to day)?)\s*[:\u2013-]?\s*",
+                   "", s, flags=re.I)
+        if 20 < len(s) < 160 and any(v in s.lower() for v in verbs):
+            out.append(s[:150])
+        if len(out) >= n:
+            break
+    return out or ["As described in the posting — see direct link"]
+
+def deadline_line(j):
+    """Deadline with urgency marker if close."""
+    dl = find_deadline(j)
+    if not dl:
+        return "⚠️ Deadline: Not specified"
+    d = parse_date_any(dl)
+    if d:
+        import datetime as dt
+        days = (d - dt.date.today()).days
+        if days < 0:
+            return f"⚠️ Deadline: {dl} — appears PASSED, verify"
+        if days <= 2:
+            return f"🚨 Deadline in {days} day(s) — {dl}"
+        if days <= 7:
+            return f"⚠️ Deadline: {dl} (in {days} days)"
+    return f"⚠️ Deadline: {dl}"
+
+def match_tier(sc):
+    if sc >= 85:
+        return "🔥 Exceptional Match"
+    if sc >= 70:
+        return "🟢 Strong Match"
+    if sc >= 60:
+        return "🟡 Stretch Match"
+    return "🟡 Stretch Match"
+
+def alert_text(j, sc, reasons, missing, gem=False):
     f = job_facts(j)
-    L = [f"{tier} [{sc}%] {j['title']} at {j['company']}", ""]
+    L = []
     add = L.append
-    add(f"🏢 {j['company']}")
-    add(f"📍 {j['location']}")
-    add(f"💰 {'Stipend: ' + f['stipend'] if f['stipend'] else 'not stated'}")
-    if f["eligibility"]:
-        add(f"🎓 {f['eligibility']}")
-    if f["deadline"]:
-        add(f"📅 Apply by {f['deadline']}")
-    if f["joining"]:
-        add(f"🚀 Joins {f['joining']}")
-    if f["duration"]:
-        add(f"⏱ {f['duration']}-month duration")
-    if f["hours"]:
-        add(f"⏰ {f['hours']} h/week")
-    add(f"⭐ Match score {sc}%")
-    add(f"👉 {j['url']}")
+    add(f"🔥 {j['title']} — {j['company']}")
     add("")
-    add("WHY: " + "; ".join(reasons[:5]))
+    add(f"📍 Location:\n{j['location']}")
+    add(f"💰 Salary/Stipend:\n{f['stipend'] or 'Not disclosed'}")
+    add(f"🏢 Company:\n{j['company']}")
+    add(f"🎓 Eligibility:\n{f['eligibility'] or 'Not disclosed'}")
+    add(f"📅 Posted:\n{j.get('date') or 'Not specified'}")
+    join_line = f['joining'] or ("Joining date unclear — verify before applying"
+                                 if j.get('_ft') else "Not specified")
+    add(f"🚀 Joining:\n{join_line}")
+    add(f"⭐ Resume Match:\n{sc}/100")
+    add(f"{match_tier(sc)}")
+    add("")
+    add("Why you match")
+    for r in reasons[:5]:
+        add(f"- {r}")
+    add("")
+    add("Missing / weaker areas")
     if missing:
-        add("MISSING SKILLS: " + ", ".join(missing[:5]))
+        for s in missing[:5]:
+            add(f"- {s}")
+    else:
+        add("- None material — you meet the stated requirements")
+    add("")
+    add("Job description")
+    add(summarize_jd(j))
+    add("")
+    add("Key responsibilities")
+    for r in extract_responsibilities(j):
+        add(f"- {r}")
+    add("")
+    add("Why this is relevant to me")
+    rel = [r for r in reasons if any(k in r for k in ("target role", "AI/ML", "project",
+                                                       "required skills", "FastAPI", "ML/data"))]
+    for r in rel[:2]:
+        add(f"- {r}")
+    if not rel:
+        add("- Builds on your Python/ML foundation toward your AI/ML career direction.")
+    add("")
+    add(deadline_line(j))
+    add("")
+    add(f"👉 DIRECT APPLICATION:\n{j['url']}")
+    add(f"🔎 Source:\n{j.get('source', 'Not specified')}")
     return "\n".join(L)
 
-def alert_email(j, sc, reasons, missing, gem):
-    """HTML twin of alert_text for the email channel."""
-    tier = GEM if gem else FIRE
+def alert_email(j, sc, reasons, missing, gem=False):
+    """HTML twin of alert_text (same sections, email-friendly)."""
     f = job_facts(j)
-    rows = [(f"🔥 {esc(j['title'])}", ""),
-            ("🏢", esc(j["company"])),
-            ("📍", esc(j["location"])),
-            ("💰", esc(f["stipend"] or "not stated")),
-            ("🎓", esc(f["eligibility"] or "—")),
-            ("📅", esc(("Apply by " + f["deadline"]) if f["deadline"] else "—")),
-            ("🚀", esc(f["joining"] or "stated in posting")),
-            ("⏱", esc(f"{f['duration']}-month" if f["duration"] else "—")),
-            ("⏰", esc(f"{f['hours']} h/week" if f["hours"] else "—")),
-            (f"⭐", f"<b>Match score {sc}%</b>"),
-            ("👉", f"<a href=\"{esc(j['url'])}\">Direct application</a>")]
-    table = "".join(f"<tr><td style='padding:2px 12px 2px 0;font-size:15px'>{k}</td>"
-                    f"<td style='font-size:15px'>{v}</td></tr>" for k, v in rows if v != "")
-    why = "".join(f"<li>+ {esc(r)}</li>" for r in reasons[:5])
-    mis = ("".join(f"<li>⚠️ {esc(m)}</li>" for m in missing[:5]) and
-           f"<b>Missing skills:</b><ul>{''.join(f'<li>⚠️ {esc(m)}</li>' for m in missing[:5])}</ul>") \
-          if missing else ""
-    return f"""<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;line-height:1.5">
-  <h2 style="margin:0 0 8px">{tier} Match score {sc}%</h2>
-  <table style="color:#222">{table}</table>
-  <h3 style="margin:12px 0 4px">Why it matches</h3><ul>{why}</ul>
-  {mis}
-  <p style="font-size:12px;color:#888">Score 85+ → immediate alert. Major companies hire months
-  ahead — apply early.</p>
+    rows = [("📍 Location:", esc(j["location"])),
+            ("💰 Salary/Stipend:", esc(f["stipend"] or "Not disclosed")),
+            ("🏢 Company:", esc(j["company"])),
+            ("🎓 Eligibility:", esc(f["eligibility"] or "Not disclosed")),
+            ("📅 Posted:", esc(j.get("date") or "Not specified")),
+            ("🚀 Joining:", esc(f["joining"] or ("Joining date unclear — verify"
+                     if j.get("_ft") else "Not specified"))),
+            (f"⭐ Resume Match:", f"<b>{sc}/100</b> — {match_tier(sc)}")]
+    table = "".join(f"<tr><td style='padding:3px 12px 3px 0;font-size:14px;vertical-align:top'>{k}</td>"
+                    f"<td style='font-size:14px'>{v}</td></tr>" for k, v in rows)
+    why = "".join(f"<li>{esc(r)}</li>" for r in reasons[:5])
+    mis = "".join(f"<li>{esc(s)}</li>" for s in (missing[:5] or ["None material — you meet the stated requirements"]))
+    resp = "".join(f"<li>{esc(r)}</li>" for r in extract_responsibilities(j))
+    return f"""<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;line-height:1.55;color:#222">
+  <h2 style="margin:0 0 10px">🔥 {esc(j['title'])} — {esc(j['company'])}</h2>
+  <table style="border-collapse:collapse">{table}</table>
+  <h3 style="margin:14px 0 4px;font-size:15px">Why you match</h3><ul style="font-size:14px;margin:0">{why}</ul>
+  <h3 style="margin:14px 0 4px;font-size:15px">Missing / weaker areas</h3><ul style="font-size:14px;margin:0">{mis}</ul>
+  <h3 style="margin:14px 0 4px;font-size:15px">Job description</h3>
+  <p style="font-size:14px">{esc(summarize_jd(j))}</p>
+  <h3 style="margin:14px 0 4px;font-size:15px">Key responsibilities</h3><ul style="font-size:14px;margin:0">{resp}</ul>
+  <h3 style="margin:14px 0 4px;font-size:15px">Why this is relevant to me</h3>
+  <p style="font-size:14px">{esc('; '.join(r for r in reasons[:2]))}</p>
+  <p style="font-size:14px;margin:12px 0 4px"><b>{esc(deadline_line(j))}</b></p>
+  <p style="font-size:14px;margin:10px 0 4px"><b>👉 DIRECT APPLICATION:</b>
+     <a href="{esc(j['url'])}">{esc(j['url'])}</a></p>
+  <p style="font-size:13px;color:#777">🔎 Source: {esc(j.get('source',''))}</p>
 </div>"""
 
 def digest_email(items):
@@ -1015,14 +1250,45 @@ def main():
     save_json(ERR_FILE, src_err)
 
     # de-dup + filter + score
-    seen_ids, scored = set(), []
+    seen_ids, scored = [], []
     now_iso = time.strftime("%Y-%m-%d %H:%M")
-    cutoff = prof.get("fulltime_available_from", "2026-12-15")
+    n_hard = n_qual = 0
+    # cross-source dedup: company+role (normalized) is the same opportunity.
+    # prefer official ATS/company URLs over aggregator copies.
+    def dedup_key(j):
+        role = re.sub(r"[^a-z0-9 ]", "", j["title"].lower())
+        role = " ".join(w for w in role.split() if w not in
+                        ("intern", "internship", "remote", "part", "time", "full"))
+        comp = re.sub(r"[^a-z0-9 ]", "", j["company"].lower())
+        return (comp, role[:60])
+    ATS_PRIORITY = ("ashby", "greenhouse", "lever", "smartrecruiters", "netflix",
+                    "amazon", "remotive", "remoteok", "jobicy", "arbeitnow",
+                    "internshala", "wellfound", "linkedin", "indeed", "youtube")
+    by_key = {}
     for j in all_jobs:
         if not j.get("title") or not j.get("url") or j["id"] in seen_ids:
             continue
-        seen_ids.add(j["id"])
+        seen_ids.append(j["id"])
         if not is_target_title(j["title"]):
+            continue
+        # keep only the best-source copy of each (company, role) pair
+        k = dedup_key(j)
+        if k in by_key:
+            kept = by_key[k]
+            if ATS_PRIORITY.index(j["source"]) < ATS_PRIORITY.index(kept["source"]):
+                by_key[k] = j
+            continue
+        by_key[k] = j
+    for j in by_key.values():
+        # STEP 11 quality gate: scams / unidentifiable companies / stale listings
+        q = quality_check(j, prof)
+        if q:
+            n_qual += 1
+            continue
+        # STEP 4-6 hard eligibility gate
+        hv = hard_eligibility(j, prof)
+        if hv:
+            n_hard += 1
             continue
         sc, reasons, missing, is_ft = score_job(j, prof, cfg)
         if sc <= 0:
@@ -1030,7 +1296,8 @@ def main():
         j["_ft"] = is_ft
         scored.append((sc, j, reasons, missing))
     scored.sort(key=lambda x: -x[0])
-    log(f"scored {len(scored)} relevant of {len(all_jobs)} raw")
+    log(f"scored {len(scored)} relevant of {len(all_jobs)} raw "
+        f"(blocked: {n_hard} hard-eligibility, {n_qual} quality/scam/dup)")
 
     fire, digest, stretch = [], [], []
     for sc, j, reasons, missing in scored:
@@ -1076,7 +1343,7 @@ def main():
     if dry:
         print("\n===== DRY RUN — what would be delivered =====")
         for sc, j, r, m in to_alert:
-            print(alert_text(j, sc, r, m, sc < 60))
+            print(alert_text(j, sc, r, m))
             print("-" * 70)
         if to_digest:
             print("DIGEST:")
@@ -1087,10 +1354,9 @@ def main():
 
     sent = []
     for sc, j, r, m in to_alert:
-        gem = sc < 60
-        subject = f"{GEM if gem else FIRE} [{sc}%] Match — {j['title']} at {j['company']}"
-        via = deliver(cfg, subject, alert_email(j, sc, r, m, gem),
-                      alert_text(j, sc, r, m, gem))
+        subject = f"🔥 [{sc}%] Match — {j['title']} at {j['company']}"
+        via = deliver(cfg, subject, alert_email(j, sc, r, m),
+                      alert_text(j, sc, r, m))
         if via:
             sent.append(via)
             seen[j["id"]] = now_iso
