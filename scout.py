@@ -1304,7 +1304,7 @@ def main():
             seen.pop(k)
     save_json(SEEN_FILE, seen)
     # a silent exit code keeps the Actions run green; delivery failures are already logged
-    log(f"done: seen={len(seen)} alerts={len(to_alert)} digest={len(to_digest)}")
+    log(f"done: seen={len(seen)} sent={sent} scored={len(scored)}")
     return 0
 
 if __name__ == "__main__":
