@@ -567,14 +567,15 @@ def find_deadline(j):
     return None
 
 def find_joining(j):
-    """Joining/start date hints: cohort year, season+year, or 'starting <date>'."""
+    """Joining/start date hints: cohort year, season+year, or 'starting <date>'.
+    Only future dates (2026+) count; older years are JD noise, not a joining date."""
     title = (j.get("title") or "").lower()
     body = (j.get("desc") or "")[:800].lower()
-    m = re.search(r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|winter|spring|summer|fall|autumn)[a-z]*\.?\s*20\d\d)", title + " " + body)
+    m = re.search(r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|winter|spring|summer|fall|autumn)[a-z]*\.?\s*20(?:2[6-9]|[3-9]\d))", title + " " + body)
     if m:
         return clean(m.group(1))
     m = re.search(r"(?:joining|start(?:s|ing)? (?:on|date|from))[:\s]*"
-                  r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+20\d\d)", body)
+                  r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+20(?:2[6-9]|[3-9]\d))", body)
     if m:
         return clean(m.group(1))
     return None
@@ -880,6 +881,7 @@ def esc(s):
 def tg_send(cfg, text_html):
     token, chat = cfg.get("telegram_bot_token"), cfg.get("telegram_chat_id")
     if not token or not chat:
+        log("telegram not configured: missing token/chat_id")
         return False
     ok = True
     for i in range(0, len(text_html), 3800):
@@ -895,6 +897,8 @@ def tg_send(cfg, text_html):
                 if not resp.get("ok"):
                     log(f"telegram: API said not ok: {str(resp)[:300]}")
                     ok = False
+                else:
+                    log(f"telegram: message ({len(text_html[i:i+3800])} chars) delivered")
         except urllib.error.HTTPError as e:
             detail = ""
             try:
@@ -908,29 +912,12 @@ def tg_send(cfg, text_html):
             ok = False
     return ok
 
-def deliver(cfg, subject, html_body, text_body):
-    """Telegram-only delivery. Scoring tiers and email are gone by user request."""
-    tg_body = "<b>" + esc(subject) + "</b>\n\n" + tg_sanitize(html_body)
+def deliver(cfg, subject, body_text):
+    """Telegram-only delivery. body_text is plain text with light HTML markup."""
+    tg_body = "<b>" + esc(subject) + "</b>\n\n" + esc(body_text)
     if tg_send(cfg, tg_body):
         return "telegram"
     return None
-
-def tg_sanitize(html_text):
-    """Telegram HTML allows only a small tag set; drop the rest but keep newlines."""
-    allowed = {"b", "i", "u", "s", "a", "code", "pre", "blockquote"}
-    html_text = re.sub(r"(?i)<\s*(br|hr)\s*/?>", "\n", html_text)
-    html_text = re.sub(r"(?i)</?\s*(div|p|table|tr|td|th|ul|ol|li|h[1-6])\s*>",
-                       "\n", html_text)
-    out, pos = [], 0
-    for m in re.finditer(r"</?\s*([a-zA-Z0-9]+)[^>]*>", html_text):
-        tag = m.group(1).lower()
-        if tag not in allowed:
-            out.append(html_text[pos:m.start()])
-            pos = m.end()
-    out.append(html_text[pos:])
-    txt = "".join(out)
-    txt = re.sub(r"\n{3,}", "\n\n", txt)
-    return txt.strip()
 
 # ------------------------------------------------------------- formatting
 def job_facts(j):
@@ -1060,76 +1047,36 @@ def alert_text(j, sc, reasons, missing, gem=False):
     add(f"🔎 Source:\n{j.get('source', 'Not specified')}")
     return "\n".join(L)
 
-def alert_email(j, sc, reasons, missing, gem=False):
-    """HTML twin of alert_text (same sections, email-friendly)."""
-    f = job_facts(j)
-    rows = [("📍 Location:", esc(j["location"])),
-            ("💰 Salary/Stipend:", esc(f["stipend"] or "Not disclosed")),
-            ("🏢 Company:", esc(j["company"])),
-            ("🎓 Eligibility:", esc(f["eligibility"] or "Not disclosed")),
-            ("📅 Posted:", esc(j.get("date") or "Not specified")),
-            ("🚀 Joining:", esc(f["joining"] or ("Joining date unclear — verify"
-                     if j.get("_ft") else "Not specified"))),
-            (f"⭐ Resume Match:", f"<b>{sc}/100</b> — {match_tier(sc)}")]
-    table = "".join(f"<tr><td style='padding:3px 12px 3px 0;font-size:14px;vertical-align:top'>{k}</td>"
-                    f"<td style='font-size:14px'>{v}</td></tr>" for k, v in rows)
-    why = "".join(f"<li>{esc(r)}</li>" for r in reasons[:5])
-    mis = "".join(f"<li>{esc(s)}</li>" for s in (missing[:5] or ["None material — you meet the stated requirements"]))
-    resp = "".join(f"<li>{esc(r)}</li>" for r in extract_responsibilities(j))
-    return f"""<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;line-height:1.55;color:#222">
-  <h2 style="margin:0 0 10px">🔥 {esc(j['title'])} — {esc(j['company'])}</h2>
-  <table style="border-collapse:collapse">{table}</table>
-  <h3 style="margin:14px 0 4px;font-size:15px">Why you match</h3><ul style="font-size:14px;margin:0">{why}</ul>
-  <h3 style="margin:14px 0 4px;font-size:15px">Missing / weaker areas</h3><ul style="font-size:14px;margin:0">{mis}</ul>
-  <h3 style="margin:14px 0 4px;font-size:15px">Job description</h3>
-  <p style="font-size:14px">{esc(summarize_jd(j))}</p>
-  <h3 style="margin:14px 0 4px;font-size:15px">Key responsibilities</h3><ul style="font-size:14px;margin:0">{resp}</ul>
-  <h3 style="margin:14px 0 4px;font-size:15px">Why this is relevant to me</h3>
-  <p style="font-size:14px">{esc('; '.join(r for r in reasons[:2]))}</p>
-  <p style="font-size:14px;margin:12px 0 4px"><b>{esc(deadline_line(j))}</b></p>
-  <p style="font-size:14px;margin:10px 0 4px"><b>👉 DIRECT APPLICATION:</b>
-     <a href="{esc(j['url'])}">{esc(j['url'])}</a></p>
-  <p style="font-size:13px;color:#777">🔎 Source: {esc(j.get('source',''))}</p>
-</div>"""
+def split_full_rest(to_send, cfg):
+    """Top N jobs get the full card; everything else goes in the compact digest."""
+    n = int(cfg.get("full_cards_per_run", 3))
+    return to_send[:n], to_send[n:]
 
-def digest_email(items):
-    out = []
-    for sc, j, reasons, missing in items:
-        color = "#e6a100" if sc < 70 else "#1a7f37"
-        tier = STRT if sc < 70 else GOOD
-        mis = (f"<div style='color:#a33;font-size:12px;margin-top:3px'>Missing: "
-               f"{esc(', '.join(missing[:5]))}</div>") if missing else ""
-        out.append(f"""<div style="border:1px solid #ddd;border-radius:8px;padding:10px 14px;margin:10px 0">
-  <div style="font-size:15px"><span style="color:{color};font-weight:700">{tier} [{sc}%]</span>
-  <b>{esc(j['title'])}</b> — {esc(j['company'])}</div>
-  <div style="font-size:13px;color:#555">{esc(j['location'])} · {esc(j['source'])}</div>
-  <div style="font-size:13px;margin-top:4px">{esc(' · '.join(reasons[:4]))}{mis}</div>
-  <div style="margin-top:6px"><a href="{esc(j['url'])}" style="font-size:13px">View posting →</a></div>
-</div>""")
-    return "".join(out) + ("<p style='font-size:12px;color:#888'>🟢 strong match (70-84) · "
-                           "🟡 stretch match (60-69 — missing skills shown)</p>")
+def compact_line(sc, j, r, m):
+    """2-line compact entry for the digest message."""
+    badge = ("🔥" if sc >= 85 else "🟢" if sc >= 70 else "🟡")
+    tags = []
+    for reason in r:
+        if "🎯" in reason and len(tags) < 2:
+            tags.append("🎯 early-hiring")
+        elif "UNPAID" in reason and len(tags) < 2:
+            tags.append("⚠ UNPAID")
+        elif "HARD ELIGIBILITY" in reason and len(tags) < 2:
+            tags.append("❌ hard-eligibility")
+        elif "h/week" in reason and "heavy" in reason and len(tags) < 2:
+            tags.append("⏰ heavy hours")
+    join = find_joining(j)
+    if join and len(tags) < 2:
+        tags.append("🚀 " + join)
+    loc = j.get("location", "") or ""
+    tag_txt = (" · " + " · ".join(t for t in tags if t)) if tags else ""
+    line1 = f"{badge} [{sc}%] {j['title']} — {j['company']}{tag_txt}"
+    line2 = f"   {loc} · {j['url']}" if loc else f"   {j['url']}"
+    return line1[:180] + "\n" + line2[:200]
 
-def digest_text(items):
-    blocks = []
-    for sc, j, reasons, missing in items:
-        tier = STRT if sc < 70 else GOOD
-        b = f"{tier} [{sc}%] {j['title']} — {j['company']}\n   📍 {j['location']}\n   👉 {j['url']}\n   " + "; ".join(reasons[:4])
-        if missing:
-            b += "\n   Missing: " + ", ".join(missing[:5])
-        blocks.append(b)
-    return "\n\n".join(blocks)
-
-def digest_tg(items):
-    blocks = []
-    for sc, j, reasons, missing in items:
-        tier = STRT if sc < 70 else GOOD
-        b = (f"{tier} <b>[{sc}%] {esc(j['title'])}</b> — {esc(j['company'])}\n"
-             f"<a href=\"{esc(j['url'])}\">open</a> · {esc(j['location'])}\n"
-             + esc(" · ".join(reasons[:3])))
-        if missing:
-            b += "\n⚠️ missing: " + esc(", ".join(missing[:4]))
-        blocks.append(b)
-    return "\n\n".join(blocks)
+def compact_digest(items):
+    """One compact list: 2 lines per job, ~150 chars each."""
+    return "\n\n".join(compact_line(sc, j, r, m) for sc, j, r, m in items)
 
 # ------------------------------------------------------------------- main
 def main():
@@ -1137,6 +1084,7 @@ def main():
     cfg = load_json(BASE / "telegram.json", {}) or {}  # legacy email.json also still works
     if not cfg.get("telegram_bot_token") or not cfg.get("telegram_chat_id"):
         cfg = load_json(BASE / "email.json", {}) or {}
+    cfg.setdefault("full_cards_per_run", 3)
     dry = "--no-send" in sys.argv
     force_digest = "--digest" in sys.argv
     # helper: python scout.py --telegram-id  (print chat ids after you message the bot)
@@ -1210,7 +1158,7 @@ def main():
     seen_ids, scored = [], []
     now_iso = time.strftime("%Y-%m-%d %H:%M")
     n_qual = n_hard = 0
-    # cross-source dedup: company+role (normalized) is the same opportunity.
+    # cross-source dedup + persistent fingerprint (company+role normalized);
     # prefer official ATS/company URLs over aggregator copies.
     def dedup_key(j):
         role = re.sub(r"[^a-z0-9 ]", "", j["title"].lower())
@@ -1270,34 +1218,69 @@ def main():
     log(f"scored {len(scored)} relevant of {len(all_jobs)} raw "
         f"(blocked: {n_qual} scam/fake; {n_hard} other)")
 
-    # No score-tier splitting: every fresh job goes in one Telegram digest.
-    to_send = [x for x in scored if x[1]["id"] not in seen]
-    log(f"to-send={len(to_send)}")
+    # No score-tier splitting: every fresh job is delivered.
+    # Persistent fingerprints stop Internshala reposts (same role+company, new URL
+    # timestamp) from re-alerting across runs.
+    fps = seen.get("fps", {}) if isinstance(seen, dict) else {}
+    to_send = []
+    for x in scored:
+        sc, j, r, m = x
+        if j["id"] in seen:
+            continue
+        fp = dedup_key(j)
+        if fp in fps:
+            continue
+        to_send.append(x)
+    log(f"to-send={len(to_send)} (of {len(scored)} scored)")
 
     if dry:
         print("\n===== DRY RUN — what would be delivered =====")
-        for sc, j, r, m in to_send:
+        top, rest = split_full_rest(to_send, cfg)
+        for sc, j, r, m in top:
+            print(f"--- FULL CARD: {j['title']} at {j['company']} ---")
             print(alert_text(j, sc, r, m))
-            print("-" * 70)
+        if rest:
+            print("=== COMPACT DIGEST ===")
+            print(compact_digest(rest))
         if not to_send:
             print("(nothing new)")
         return 0
 
     sent = 0
     if to_send:
-        # split into Telegram-sized chunks; each chunk is one Telegram message
-        BATCH = 4
-        for i in range(0, len(to_send), BATCH):
-            chunk = to_send[i:i + BATCH]
-            chunk_subject = (f"🟢 {len(to_send)} new opportunities ({now_iso})"
-                             if i == 0 else f"  ...continued ({i+1}-{i+len(chunk)} of {len(to_send)})")
-            chunk_text = "\n\n---\n\n".join(alert_text(j, sc, r, m) for sc, j, r, m in chunk)
-            via = deliver(cfg, chunk_subject, "", chunk_text)
-            if via:
-                sent += len(chunk)
-                for sc, j, r, m in chunk:
-                    seen[j["id"]] = now_iso
-        log(f"delivered {sent} opportunities")
+        top, rest = split_full_rest(to_send, cfg)
+        # 1) a few full cards, one message each
+        for sc, j, r, m in top:
+            subj = f"🔥 [{sc}%] {j['title']} at {j['company']}"
+            if deliver(cfg, subj, alert_text(j, sc, r, m)):
+                sent += 1
+                seen[j["id"]] = now_iso
+                fps[dedup_key(j)] = now_iso
+        # 2) everything else in one compact digest (split only on overflow)
+        if rest:
+            lines = compact_digest(rest).split("\n")
+            part, parts, budget = [], [], 3500
+            for ln in lines:
+                if budget - len(ln) < 0 and part:
+                    parts.append("\n".join(part))
+                    part, budget = [], 3500
+                part.append(ln)
+                budget -= len(ln) + 1
+            if part:
+                parts.append("\n".join(part))
+            total_parts = len(parts)
+            for idx, ptext in enumerate(parts):
+                hdr = (f"🟢 {len(rest)} more opportunities ({now_iso})"
+                       if total_parts == 1 and idx == 0
+                       else f"🟢 More opportunities — part {idx+1}/{total_parts}")
+                if deliver(cfg, hdr, ptext):
+                    pass
+            for sc, j, r, m in rest:
+                sent += 1
+                seen[j["id"]] = now_iso
+                fps[dedup_key(j)] = now_iso
+        seen["fps"] = fps
+        log(f"delivered {sent} opportunities ({len(top)} full cards + {len(rest)} compact)")
 
     if len(seen) > 5000:
         for k in sorted(seen, key=seen.get)[:1500]:
