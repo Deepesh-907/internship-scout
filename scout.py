@@ -1220,15 +1220,19 @@ def main():
 
     # No score-tier splitting: every fresh job is delivered.
     # Persistent fingerprints stop Internshala reposts (same role+company, new URL
-    # timestamp) from re-alerting across runs.
-    fps = seen.get("fps", {}) if isinstance(seen, dict) else {}
+    # timestamp) from re-alerting across runs. fps keys are "company|role" strings.
+    fps = seen.get("fps", {}) or {}
+
+    def fp_of(j):
+        c, r = dedup_key(j)
+        return f"{c}|{r}"
+
     to_send = []
     for x in scored:
         sc, j, r, m = x
         if j["id"] in seen:
             continue
-        fp = dedup_key(j)
-        if fp in fps:
+        if fp_of(j) in fps:
             continue
         to_send.append(x)
     log(f"to-send={len(to_send)} (of {len(scored)} scored)")
@@ -1255,7 +1259,7 @@ def main():
             if deliver(cfg, subj, alert_text(j, sc, r, m)):
                 sent += 1
                 seen[j["id"]] = now_iso
-                fps[dedup_key(j)] = now_iso
+                fps[fp_of(j)] = now_iso
         # 2) everything else in one compact digest (split only on overflow)
         if rest:
             lines = compact_digest(rest).split("\n")
@@ -1278,7 +1282,7 @@ def main():
             for sc, j, r, m in rest:
                 sent += 1
                 seen[j["id"]] = now_iso
-                fps[dedup_key(j)] = now_iso
+                fps[fp_of(j)] = now_iso
         seen["fps"] = fps
         log(f"delivered {sent} opportunities ({len(top)} full cards + {len(rest)} compact)")
 
