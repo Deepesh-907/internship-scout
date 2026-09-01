@@ -1121,6 +1121,39 @@ def main():
     dry = "--no-send" in sys.argv
     force_digest = "--digest" in sys.argv
     # helper: python scout.py --telegram-id  (print chat ids after you message the bot)
+    if "--test-alert" in sys.argv:
+        # Send one synthetic BCA-friendly job through the full production path
+        # (same gates + card renderer + Telegram sender as real deliveries).
+        import os
+        for env_key, cfg_key in [("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
+                                 ("TELEGRAM_CHAT_ID", "telegram_chat_id")]:
+            if os.environ.get(env_key):
+                cfg[cfg_key] = os.environ[env_key]
+        tj = {
+            "id": "TEST:zoho-ml-intern-2026",
+            "title": "Machine Learning Intern (Remote)",
+            "company": "Zoho",
+            "location": "Remote India",
+            "url": "https://careers.zohocorp.com/jobs/Careers/ML-INTERN-2026",
+            "desc": ("Machine Learning Internship for students pursuing BCA/BTech. "
+                     "Requirements: Python, Pandas, NumPy, Scikit-learn, Machine Learning. "
+                     "FastAPI preferred. What you'll do: Build ML models on real product "
+                     "data, analyze data pipelines, and deploy prediction features. "
+                     "Stipend: Rs 25,000 per month. 6-month internship, flexible hours. "
+                     "Apply by Oct 15, 2026. Joining: January 2027."),
+            "date": time.strftime("%Y-%m-%d"), "source": "internshala",
+        }
+        ok, tag = location_gate(tj)
+        sc, r, ms, ft = score_job(tj, prof, cfg)
+        log(f"test job: location_gate={ok} score={sc} ft={ft}")
+        if sc < int(cfg.get("min_score", 60)):
+            log("TEST FAILED: synthetic job scored below floor — scoring bug")
+            return 1
+        subj = f"🧪 TEST 🔥 [{sc}%] Machine Learning Intern at Zoho"
+        via = deliver(cfg, subj, alert_text(tj, sc, r, ms))
+        log(f"test card delivered via {via}")
+        return 0 if via else 1
+
     if "--telegram-id" in sys.argv:
         token = cfg.get("telegram_bot_token") or input("Paste bot token: ").strip()
         try:
