@@ -201,8 +201,12 @@ def adp_netflix(p):
     return out
 
 def adp_amazon(p):
+    # NOTE: adding country=IND makes amazon.jobs silently ignore base_query
+    # (verified live: returns senior roles matching 'international' in text,
+    # zero real internships). Global query returns real internships; the
+    # location gate drops onsite-abroad afterwards.
     d = get_json("https://www.amazon.jobs/en/search.json?base_query=internship"
-                 "&result_limit=40&country=IND")
+                 "&result_limit=100")
     out = []
     for j in d.get("jobs", []):
         if not j.get("is_intern") and "intern" not in (j.get("title") or "").lower() \
@@ -392,11 +396,11 @@ def adp_google(p):
     return out
 
 def adp_internshala(p):
-    """Internshala ML/Python/software internship listing pages -> detail links."""
+    """Internshala — demoted to a single highest-signal page (ML); low-signal
+    keyword scrapes removed. Its score floor is raised separately in main()."""
     out = []
     seen = set()
-    for kw in ("machine%20learning", "python", "artificial%20intelligence",
-               "software%20development"):
+    for kw in ("machine%20learning",):
         try:
             page = http(f"https://internshala.com/internships/{kw}-internship/",
                         headers={"Accept": "text/html"}).decode("utf-8", "replace")
@@ -502,7 +506,8 @@ def is_target_title(title):
                                     "programming", "backend", "full stack", "full-stack",
                                     "sde", "tech", "automation", "computer", "research",
                                     "science", "genai", "llm", "cloud", "coding",
-                                    "technical", "technical staff")):
+                                    "technical", "technical staff")) \
+           and not re.search(r"\bswe\b", t):
             return False
         return True
     return any(k in t for k in ENTRY_KEYS)
@@ -542,9 +547,9 @@ def find_stipend(body):
     """Pull a short salary/stipend snippet if present (skip perk stipends like lunch)."""
     pats = [r"(?:stipend|salary|compensation|pay(?:ing)?|interns? (?:are |get )?(?:paid|earn))"
             r"[^.;\n]{0,60}(?:₹|\$|rs\.?|inr|usd)\s?[\d,.]+[kkl]?\s?"
-            r"(?:/?\s?(?:month|mo|yr|year|annum|lpa|pa|hour|hr|week))?",
+            r"(?:/?\s?(?:per\s)?(?:month|mo|yr|year|annum|lpa|pa|hour|hr|week))?",
             r"(?:₹|\$|rs\.?|inr|usd)\s?[\d,.]+\s?(?:k|lakh|lpa)?\s?"
-            r"(?:per month|/month|monthly|per annum|annually|per hour|/hr)",
+            r"(?:/?\s?(?:per\s)?(?:month(?:ly)?|mo|yr|year|annum|pa|hour|hr|week)|annually)",
             r"[\d,.]+\s?(?:lpa|lakhs?)(?!\s)",
             r"\bunpaid\b|not paid"]
     for p in pats:
@@ -1098,13 +1103,26 @@ def compact_line(sc, j, r, m):
         elif "h/week" in reason and "heavy" in reason and len(tags) < 2:
             tags.append("⏰ heavy hours")
     join = find_joining(j)
-    if join and len(tags) < 2:
+    if join and len(tags) < 3:
         tags.append("🚀 " + join)
+    # essentials so a digest line alone is actionable (user: don't be so quick
+    # that essentials are lost) — stipend + deadline before cosmetic tags
+    stp = find_stipend(j.get("desc") or "")
+    if stp:
+        stp = ("⚠ UNPAID" if re.search(r"unpaid|not paid", stp, re.I) else "💰 " + stp)
+        if stp not in tags and len(tags) < 4:
+            tags.append(stp[:40])
+    dl = find_deadline(j)
+    if dl and len(tags) < 5:
+        tags.append("📅 " + dl[:18])
+    if any(x in (j.get("eligibility") or "") for x in ("BCA", "bca", "B.Sc", "Bachelors")):
+        if len(tags) < 5:
+            tags.append("🎓 BCA-friendly")
     loc = j.get("location", "") or ""
     tag_txt = (" · " + " · ".join(t for t in tags if t)) if tags else ""
     line1 = f"{badge} [{sc}%] {j['title']} — {j['company']}{tag_txt}"
     line2 = f"   {loc} · {j['url']}" if loc else f"   {j['url']}"
-    return line1[:180] + "\n" + line2[:200]
+    return line1[:220] + "\n" + line2[:200]
 
 def compact_digest(items):
     """One compact list: 2 lines per job, ~150 chars each."""
@@ -1114,10 +1132,23 @@ def compact_digest(items):
 def main():
     prof = load_json(BASE / "profile.json", {})
     cfg = load_json(BASE / "telegram.json", {}) or {}  # legacy email.json also still works
-    if not cfg.get("telegram_bot_token") or not cfg.get("telegram_chat_id"):
-        cfg = load_json(BASE / "email.json", {}) or {}
+    # Credentials are normally empty here (they live in GitHub Secrets); that
+    # must NOT discard the non-credential knobs in telegram.json (min_score,
+    # full_cards_per_run, internshala_min_score). Merge instead of replace.
+    tg_token = cfg.get("telegram_bot_token") or ""
+    tg_chat = cfg.get("telegram_chat_id") or ""
+    if not tg_token or not tg_chat:
+        legacy = load_json(BASE / "email.json", {}) or {}
+        tg_token = tg_token or legacy.get("telegram_bot_token") or ""
+        tg_chat = tg_chat or legacy.get("telegram_chat_id") or ""
+        for k, v in legacy.items():
+            if k not in cfg:
+                cfg[k] = v
+    cfg["telegram_bot_token"], cfg["telegram_chat_id"] = tg_token, tg_chat
     cfg.setdefault("full_cards_per_run", 3)
     cfg.setdefault("min_score", 60)
+    # Internshala is demoted (per user): needs a higher bar to earn an alert.
+    cfg.setdefault("internshala_min_score", 70)
     dry = "--no-send" in sys.argv
     force_digest = "--digest" in sys.argv
     # helper: python scout.py --telegram-id  (print chat ids after you message the bot)
@@ -1184,18 +1215,18 @@ def main():
                              "JuniperNetworks", "adp", "SonyInteractiveEntertainmentGlobal"]
     prof["_gh_companies"] = ["stripe", "databricks", "figma", "cloudflare", "mongodb",
                              "twilio", "robinhood", "reddit", "dropbox", "coinbase",
-                             "nuro"]
+                             "nuro", "roblox", "samsara", "flexport", "block"]
     prof["_lever_companies"] = ["spotify"]
     prof["_ashby_companies"] = ["elevenlabs", "Perplexity", "Cohere", "Runway",
-                                "baseten", "groq", "mistral", "togetherai"]
+                                "baseten", "openai", "notion", "ramp", "modal"]
     SLUGS = {}
     for c in prof["_sr_companies"] + prof["_gh_companies"] + prof["_lever_companies"] + prof["_ashby_companies"]:
         SLUGS[c.lower()] = c.replace("-", " ").title()
-    SLUGS.update({"openai": "OpenAI", "mistral": "Mistral AI", "groq": "Groq",
-                  "huggingface": "Hugging Face", "deepmind": "DeepMind",
+    SLUGS.update({"openai": "OpenAI", "huggingface": "Hugging Face", "deepmind": "DeepMind",
                   "perplexity": "Perplexity", "elevenlabs": "ElevenLabs",
-                  "runway": "Runway", "cohere": "Cohere", "togetherai": "Together AI",
-                  "modal-labs": "Modal", "baseten": "Baseten", "deepl": "DeepL"})
+                  "runway": "Runway", "cohere": "Cohere", "modal": "Modal",
+                  "baseten": "Baseten", "deepl": "DeepL", "notion": "Notion",
+                  "ramp": "Ramp"})
     globals()["_COMPANY_SLUGS"] = SLUGS
 
     seen = load_json(SEEN_FILE, {})
@@ -1263,7 +1294,10 @@ def main():
             continue
         sc, reasons, missing, is_ft = score_job(j, prof, cfg)
         # Score floor: below 60% is not worth your attention (per user rule).
-        if sc < int(cfg.get("min_score", 60)):
+        # Internshala needs a higher bar (demoted source).
+        floor = int(cfg.get("internshala_min_score", 70)) if j["source"] == "internshala" \
+            else int(cfg.get("min_score", 60))
+        if sc < floor:
             n_score += 1
             continue
         j["_ft"] = is_ft
@@ -1357,9 +1391,16 @@ def main():
         seen["fps"] = fps
         log(f"delivered {sent} opportunities ({len(top)} full cards + {len(rest)} compact)")
 
+    # prune old entries so seen.json stays small. NOTE: 'fps' holds a dict,
+    # so it must be pruned separately — sorting mixed str/dict values crashes.
     if len(seen) > 5000:
+        fps_rec = seen.pop("fps", {})
         for k in sorted(seen, key=seen.get)[:1500]:
             seen.pop(k)
+        if len(fps_rec) > 3000:
+            for k in sorted(fps_rec, key=fps_rec.get)[:1000]:
+                fps_rec.pop(k)
+        seen["fps"] = fps_rec
     save_json(SEEN_FILE, seen)
     # a silent exit code keeps the Actions run green; delivery failures are already logged
     log(f"done: seen={len(seen)} sent={sent} scored={len(scored)}")
