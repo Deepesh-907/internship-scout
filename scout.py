@@ -141,7 +141,7 @@ def indeed_jsonld(page):
 def J(src, jid, title, company, loc, url, desc, date=""):
     return {"id": f"{src}:{jid}", "title": clean(str(title)), "company": clean(str(company)),
             "location": clean(str(loc)) or "Not specified", "url": url,
-            "desc": clean(str(desc))[:4000], "date": (date or "")[:10], "source": src}
+            "desc": clean(str(desc))[:8000], "date": (date or "")[:10], "source": src}
 
 # slug -> display name for ATS board companies; populated in main() before feeds run
 _COMPANY_SLUGS = {}
@@ -294,11 +294,16 @@ def adp_ashby(p):
         for j in d.get("jobs", []):
             if not is_target_title(j.get("title", "")):
                 continue
-            out.append(J("ashby", j.get("id"), j.get("title"), company_map(company),
-                         f"{j.get('location','')} {j.get('workplaceType','')}",
+            # location + workplaceType (workplaceType can be None — never print 'None')
+            loc = " ".join(x for x in (str(j.get("location") or ""),
+                                       str(j.get("workplaceType") or "")) if x and x != "None")
+            # employmentType gives reliable intern/full-time signal the scorer can use
+            et = {"intern": "internship", "fulltime": "full-time"}.get(
+                str(j.get("employmentType") or "").lower().replace("_", ""), "")
+            desc = f"{j.get('descriptionPlain') or j.get('descriptionHtml') or ''} {et}"
+            out.append(J("ashby", j.get("id"), j.get("title"), company_map(company), loc,
                          j.get("jobUrl") or j.get("applyUrl") or f"https://jobs.ashbyhq.com/{company}",
-                         f"{j.get('descriptionHtml','')} {j.get('descriptionPlain','')}",
-                         (j.get("publishedAt") or "")))
+                         desc, (j.get("publishedAt") or "")))
     return out
 
 def adp_wellfound(p):
@@ -589,7 +594,7 @@ def find_eligibility(j):
                   r"b\.?tech|b\.\s?e\.?\b|b\.?sc\b|bachelor'?s?(?: degree)?|master'?s?(?: s)?|ph\.?d)"
                   r"[^.|;\n]{0,110}", body, re.I)
     if m:
-        return clean(m.group(0))[:130]
+        return clean(m.group(0))[:160].rsplit(" ", 1)[0] + "…" if len(clean(m.group(0))) > 160 else clean(m.group(0))
     return None
 
 # ------------------------------------------------------------- eligibility
@@ -668,6 +673,35 @@ def hard_eligibility(j, prof):
                 v.append(f"❌ HARD ELIGIBILITY ISSUE: joining {joining} is before your 15 Dec 2026 availability")
 
     return v
+
+# ------------------------------------------------------------- location gate
+INDIA_CITIES = ("noida", "greater noida", "delhi", "ncr", "gurgaon", "gurugram", "india",
+                "bengaluru", "bangalore", "hyderabad", "pune", "mumbai", "chennai",
+                "kolkata", "ahmedabad", "jaipur", "indore", "kochi", "coimbatore",
+                "bhopal", "nagpur", "lucknow", "chandigarh", "dehradun", "remote india",
+                "india (internshala)", "anywhere in india")
+
+def location_gate(j):
+    """Remote is always fine (workplaceType=Remote beats any city name — 'Toronto/Remote'
+    means remote-eligible worldwide). Onsite is fine only in India. Onsite abroad -> skip.
+    Returns (ok, tag)."""
+    loc = (j.get("location") or "").lower()
+    is_remote = ("remote" in loc or "work from home" in loc or "wfh" in loc
+                 or "anywhere" in loc or "hybrid-remote" in loc)
+    if not is_remote:
+        # some boards put remote info only in the description head
+        head = (j.get("desc") or "")[:600].lower()
+        is_remote = bool(re.search(r"\bremote\b|work from home|wfh|work anywhere", head))
+    in_india = any(c in loc for c in INDIA_CITIES)
+    if is_remote:
+        # remote roles that name a country are usually 'remote within that region' —
+        # still worth showing with a note; user verifies India eligibility
+        return True, None
+    if in_india:
+        return True, "India onsite"
+    if "hybrid" in loc:
+        return False, "hybrid abroad"  # hybrid abroad means regular office presence
+    return False, "onsite abroad"
 
 def quality_check(j, prof):
     """Scam / fake / expired listing detection. Returns list of issues."""
@@ -962,10 +996,10 @@ def extract_responsibilities(j, n=3):
              "optimize", "integrate", "build", "participate", "contribute")
     out = []
     for s in re.split(r"(?:<li[^>]*>|\n|;\s|(?<=[.!?])\s+)", clean(seg)):
-        s = s.strip(" -•\u2022\t")
         s = re.sub(r"^(?:what you['\u2019]?ll (?:do|work on)|responsibilit(?:y|ies)|"
                    r"key (?:duties|tasks)|you will|your day(?: to day)?)\s*[:\u2013-]?\s*",
                    "", s, flags=re.I)
+        s = re.sub(r"^[-–—•\s]+", "", s)
         if 20 < len(s) < 160 and any(v in s.lower() for v in verbs):
             out.append(s[:150])
         if len(out) >= n:
@@ -1004,16 +1038,14 @@ def alert_text(j, sc, reasons, missing, gem=False):
     add = L.append
     add(f"🔥 {j['title']} — {j['company']}")
     add("")
-    add(f"📍 Location:\n{j['location']}")
-    add(f"💰 Salary/Stipend:\n{f['stipend'] or 'Not disclosed'}")
-    add(f"🏢 Company:\n{j['company']}")
-    add(f"🎓 Eligibility:\n{f['eligibility'] or 'Not disclosed'}")
-    add(f"📅 Posted:\n{j.get('date') or 'Not specified'}")
+    add(f"📍 {j['location']}")
+    add(f"💰 {f['stipend'] or 'Not disclosed'}")
+    add(f"🎓 {f['eligibility'] or 'Not disclosed'}")
+    add(f"📅 Posted: {j.get('date') or 'Not specified'}")
     join_line = f['joining'] or ("Joining date unclear — verify before applying"
                                  if j.get('_ft') else "Not specified")
-    add(f"🚀 Joining:\n{join_line}")
-    add(f"⭐ Resume Match:\n{sc}/100")
-    add(f"{match_tier(sc)}")
+    add(f"🚀 Joining: {join_line}")
+    add(f"⭐ Resume Match: {sc}/100 — {match_tier(sc)}")
     add("")
     add("Why you match")
     for r in reasons[:5]:
@@ -1043,8 +1075,8 @@ def alert_text(j, sc, reasons, missing, gem=False):
     add("")
     add(deadline_line(j))
     add("")
-    add(f"👉 DIRECT APPLICATION:\n{j['url']}")
-    add(f"🔎 Source:\n{j.get('source', 'Not specified')}")
+    add(f"👉 {j['url']}")
+    add(f"🔎 Source: {j.get('source', 'Not specified')}")
     return "\n".join(L)
 
 def split_full_rest(to_send, cfg):
@@ -1085,6 +1117,7 @@ def main():
     if not cfg.get("telegram_bot_token") or not cfg.get("telegram_chat_id"):
         cfg = load_json(BASE / "email.json", {}) or {}
     cfg.setdefault("full_cards_per_run", 3)
+    cfg.setdefault("min_score", 60)
     dry = "--no-send" in sys.argv
     force_digest = "--digest" in sys.argv
     # helper: python scout.py --telegram-id  (print chat ids after you message the bot)
@@ -1154,10 +1187,10 @@ def main():
         time.sleep(1.2)
     save_json(ERR_FILE, src_err)
 
-    # de-dup + score (no score-based filter; every relevant job is delivered)
+    # de-dup + score (score floor 60; location gate; scam filter)
     seen_ids, scored = [], []
     now_iso = time.strftime("%Y-%m-%d %H:%M")
-    n_qual = n_hard = 0
+    n_qual = n_hard = n_loc = n_score = 0
     # cross-source dedup + persistent fingerprint (company+role normalized);
     # prefer official ATS/company URLs over aggregator copies.
     def dedup_key(j):
@@ -1185,15 +1218,20 @@ def main():
             continue
         by_key[k] = j
     for j in by_key.values():
-        # Scams/clearly-fake filter only — scoring is informational, never a rejecter.
-        # PhD-only / 2026-batch / work-auth requirements are shown with a HARD-ELIGIBILITY
-        # tag so the user can decide; they're not dropped.
+        # Scams/clearly-fake filter — these are never delivered.
         q = quality_check(j, prof)
         if q:
             n_qual += 1
             continue
+        # Location gate: remote always OK; onsite OK only in India; onsite abroad skip.
+        ok, _tag = location_gate(j)
+        if not ok:
+            n_loc += 1
+            continue
         sc, reasons, missing, is_ft = score_job(j, prof, cfg)
-        if sc <= 0:
+        # Score floor: below 60% is not worth your attention (per user rule).
+        if sc < int(cfg.get("min_score", 60)):
+            n_score += 1
             continue
         j["_ft"] = is_ft
         # surface hard-eligibility as a tag (still delivered)
@@ -1215,8 +1253,8 @@ def main():
                 reasons.append("⚠️ Joining date unclear — verify before applying")
         scored.append((sc, j, reasons, missing))
     scored.sort(key=lambda x: -x[0])
-    log(f"scored {len(scored)} relevant of {len(all_jobs)} raw "
-        f"(blocked: {n_qual} scam/fake; {n_hard} other)")
+    log(f"scored {len(scored)} deliverable of {len(all_jobs)} raw "
+        f"(blocked: {n_qual} scam/fake, {n_loc} onsite-abroad, {n_score} below-score)")
 
     # No score-tier splitting: every fresh job is delivered.
     # Persistent fingerprints stop Internshala reposts (same role+company, new URL
