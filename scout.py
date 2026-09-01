@@ -389,12 +389,82 @@ def adp_google(p):
                      "", ""))
     return out
 
+def adp_internshala(p):
+    """Internshala ML/Python/software internship listing pages -> detail links."""
+    out = []
+    seen = set()
+    for kw in ("machine%20learning", "python", "artificial%20intelligence",
+               "software%20development"):
+        try:
+            page = http(f"https://internshala.com/internships/{kw}-internship/",
+                        headers={"Accept": "text/html"}).decode("utf-8", "replace")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            log(f"internshala:{kw} unreachable")
+            continue
+        for slug in re.findall(r'href="/internship/detail/([a-z0-9\-]+)"', page):
+            if slug in seen:
+                continue
+            seen.add(slug)
+            m = re.match(r"([a-z0-9\-]+?)-internship(?:-in-[a-z\-]+)?-at-([a-z0-9\-]+?)(\d{10,})$", slug)
+            if not m:
+                continue
+            role = m.group(1).replace("-", " ").title()
+            comp = m.group(2).replace("-", " ").title()
+            out.append(J("internshala", slug[:80], role, comp, "India (Internshala)",
+                        "https://internshala.com/internship/detail/" + slug,
+                        f"{role} internship via Internshala"))
+        time.sleep(1.0)
+    return out
+
+def adp_youtube(p):
+    """YouTube search restricted to recruitment-announcement-style results."""
+    out = []
+    queries = ['"internship 2027" apply announcement india',
+               '"hiring interns" company announcement 2027']
+    seen = set()
+    for q in queries:
+        try:
+            page = http("https://www.youtube.com/results?search_query=" + urllib.parse.quote(q),
+                        headers={"Accept": "text/html"}).decode("utf-8", "replace")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            continue
+        titles = [t.encode().decode("unicode_escape", "replace")
+                  for t in re.findall(r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.){5,100})"', page)]
+        chans = [c.encode().decode("unicode_escape", "replace")
+                 for c in re.findall(r'"ownerText":\{"runs":\[\{"text":"((?:[^"\\]|\\.){2,60})"', page)]
+        vids = re.findall(r'"videoId":"([\w-]{11})"', page)
+        for i, vid in enumerate(vids):
+            if vid in seen or i >= len(titles):
+                continue
+            t = titles[i]
+            tl = t.lower()
+            # only recruitment announcements, not career advice
+            if not any(k in tl for k in ("internship", "hiring", "recruit", "openings", "hiring")):
+                continue
+            if any(k in tl for k in ("roadmap", "how to crack", "resume", "tips", "prep",
+                                     "course", "complete guide to learn", "tutorial",
+                                     "interview experience", "day in", "salary of")):
+                continue
+            if not any(k in tl for k in ("2027", "2026", "apply", "openings", "announced",
+                                         "program", "drive")):
+                continue
+            seen.add(vid)
+            out.append(J("youtube", vid,
+                         t.replace("\u0026", "&")[:90],
+                         (chans[i] if i < len(chans) else "YouTube channel"),
+                         "YouTube announcement",
+                         f"https://www.youtube.com/watch?v={vid}",
+                         "Video announcement — verify on the company's official careers page"))
+        time.sleep(1.0)
+    return out[:8]
+
 SOURCES = [
     ("remotive", adp_remotive), ("remoteok", adp_remoteok), ("jobicy", adp_jobicy),
     ("arbeitnow", adp_arbeitnow), ("netflix", adp_netflix), ("amazon", adp_amazon),
     ("smartrecruiters", adp_smartrecruiters), ("greenhouse", adp_greenhouse),
     ("lever", adp_lever), ("ashby", adp_ashby), ("wellfound", adp_wellfound),
-    ("indeed", adp_indeed), ("linkedin", adp_linkedin),
+    ("internshala", adp_internshala), ("indeed", adp_indeed), ("linkedin", adp_linkedin),
+    ("youtube", adp_youtube),
 ]
 
 # ---------------------------------------------------------------- scoring
@@ -404,8 +474,13 @@ SENIOR_BLOCK = ("senior", "sr.", "sr ", "principal", "staff", "manager", "direct
 ENTRY_KEYS = ("intern", "internship", "graduate", "fresher", "campus", "new grad",
               "early career", "university grad", "university graduate", "trainee",
               "co-op", "coop", "apprentice", "junior", "entry level", "entry-level",
-              "sde", "engineer i", "analyst i", "developer i", "research fellow",
-              "software engineer, ", "member of technical staff")
+              "entry level", "sde", "engineer i", "analyst i", "developer i",
+              "research fellow", "member of technical staff", "associate software",
+              "graduate software", "junior ml", "junior ai", "python developer",
+              "backend developer", "data science", "genai", "llm", "machine learning",
+              "ai engineer", "ml engineer", "ai/ml", "artificial intelligence",
+              "software developer", "software engineer", "backend engineer",
+              "full stack", "full-stack", "python developer")
 FT_TITLE_KEYS = ("graduate", "campus", "new grad", "university", "fresher",
                  "early career", "2027", "2026", "trainee", "entry level", "entry-level")
 
@@ -413,9 +488,20 @@ def is_target_title(title):
     t = (title or "").lower()
     if not t:
         return False
+    # 'staff' alone signals senior, but 'member of technical staff' is entry-level
+    if "member of technical staff" in t:
+        return True
     if any(b in t for b in SENIOR_BLOCK):
         return False
+    # non-tech internships are out of scope regardless of 'intern' in the title
     if "intern" in t or "internship" in t:
+        if not any(k in t for k in ("ai", "ml", "machine learning", "data scien", "data analyst",
+                                    "software", "developer", "engineer", "python",
+                                    "programming", "backend", "full stack", "full-stack",
+                                    "sde", "tech", "automation", "computer", "research",
+                                    "science", "genai", "llm", "cloud", "coding",
+                                    "technical", "technical staff")):
+            return False
         return True
     return any(k in t for k in ENTRY_KEYS)
 
@@ -538,6 +624,12 @@ def score_job(j, prof, cfg):
     ai_role = any(k in title for k in ("ai", "machine learning", " ml", "ml ", "data scien",
                                        "deep learning", "nlp", "computer vision", "genai", "llm"))
     if ai_role:
+        # generic 'ai' word inside a non-technical title is not an AI/ML role
+        if "ai" in title and not any(k in title for k in ("engineer", "developer", "intern",
+                                    "scientist", "research", "ml", "machine learning",
+                                    "data scien", "nlp", "vision", "genai", "llm", "technical")):
+            ai_role = False
+    if ai_role:
         score += 18
         reasons.append("AI/ML/data role")
     elif role_hits:
@@ -587,15 +679,35 @@ def score_job(j, prof, cfg):
         reasons.append("seasonal internship")
     if re.search(r"\bflexible\b|\bflex hours\b|own pace|self-paced", body):
         score += 2
-    # 6. paid
-    if re.search(r"\bstipend\b|paid internship|\$\d|₹\d|usd \d|per month|lpa", body):
+    # 6. paid / unpaid
+    unpaid = False
+    if re.search(r"\bunpaid\b|without stipend|no stipend|non[- ]paid", body):
+        unpaid = True
+        reasons.append("⚠ UNPAID internship")
+    elif re.search(r"\bstipend\b|paid internship|\$\d|₹\d|usd \d|per month|lpa|salary", body):
         score += 4
         reasons.append("paid / stipend mentioned")
-    # 7. location relevance
-    if re.search(r"\bindia\b|bengaluru|bangalore|hyderabad|pune|mumbai|delhi|gurgaon|noida|chennai|chennai|remote", body):
+    # 7. location relevance (NCR home zone > India > remote-india > intl remote)
+    if re.search(r"\bnoida\b|greater noida|delhi ncr|\bncr\b|\bgurgaon\b|\bgurugram\b|\bdelhi\b", body):
+        score += 8
+        reasons.append("Noida/Delhi NCR — your home zone")
+    elif re.search(r"\bindia\b|bengaluru|bangalore|hyderabad|pune|mumbai|chennai|kolkata|ahmedabad|jaipur|indore", body):
         score += 4
+        if "remote" in body and re.search(r"\bindia\b", body):
+            score += 2
+            reasons.append("remote (India-eligible)")
+    else:
+        if "remote" in body and not re.search(r"\bus only\b|u\.s\. only|canada only|uk only|eu only|"
+                                              r"authorized to work in (?:the )?(?:us|uk|canada|eu)|"
+                                              r"must be (?:located|based) in (?:the )?(?:us|uk|canada)", body):
+            score += 3
+            reasons.append("international remote — check India eligibility")
+        else:
+            # onsite abroad with no India mention: low priority for a BCA student in Noida
+            score -= 12
+            reasons.append("⚠ onsite abroad — likely needs work authorization you don't have")
     # 8. major company
-    major = any(c.lower() in j["company"].lower() or c.lower() == j["source"]
+    major = any(c.lower() in j["company"].lower() or c.lower() == j.get("source", "")
                 for c in prof["major_companies"])
     if major:
         score += 6
@@ -615,6 +727,9 @@ def score_job(j, prof, cfg):
         except ValueError:
             pass
     score = max(0, min(100, round(score)))
+    # unpaid rule: only worth it if the rest is unusually strong
+    if unpaid and score < 75:
+        return 0, [], [], False
     return score, reasons, missing, is_fulltime
 
 # --------------------------------------------------------------- delivery
@@ -920,16 +1035,21 @@ def main():
     fire, digest, stretch = [], [], []
     for sc, j, reasons, missing in scored:
         if j["_ft"]:
-            # early-career full-time: only future-joining cohorts pass.
-            # Heuristic: allow if a year 2027+ is in the title, or score is very high
-            # and no past-date joining signal present; joining-date text is checked
-            # in the description when available.
-            if not (re.search(r"\b202[7-9]\b", j["title"]) or
-                    re.search(r"\b202[7-9]\b", j["desc"][:600])):
-                # no explicit future year: allow only if "winter 2026"/"dec" present
-                if not re.search(r"(december|dec|winter)\s*2026", j["desc"][:600] + j["title"].lower()):
+            joining = find_joining(j)
+            if joining:
+                # explicit date: compare against fulltime_available_from (2026-12-15)
+                if re.search(r"20(?:2[7-9]|[6][6-9])", joining) or \
+                   re.search(r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|winter|spring)[a-z]*\.?\s*2027", joining):
+                    reasons.append(f"joining {joining} — on/after 15 Dec 2026 (OK)")
+                elif re.search(r"dec[a-z]*\.?\s*2026", joining):
+                    reasons.append(f"joining {joining} — December 2026; verify it's on/after 15 Dec")
+                else:
+                    # a 2026 (or earlier) start we can't confirm is >= 15 Dec 2026
+                    reasons.append(f"⚠ joining {joining} looks BEFORE your 15 Dec 2026 availability")
                     continue
-            reasons.append("future cohort / graduate program (fits your Dec 2026 rule)")
+            else:
+                # unknown joining date: report with a verify flag, never silently drop
+                reasons.append("⚠️ Joining date unclear — verify before applying")
         if sc >= cfg["immediate_min_score"]:
             fire.append((sc, j, reasons, missing))
         elif sc >= cfg["digest_min_score"]:

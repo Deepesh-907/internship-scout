@@ -1,34 +1,70 @@
 {
-  "name": "Student",
-  "degree": "B.Tech",
-  "fields": ["Computer Science", "Data Science"],
+  "name": "Deepesh Chothwani",
+  "education": "Bachelor of Computer Applications (BCA), 2024-2027",
+  "college": "Jaypee Institute of Information Technology (JIIT), Noida, India",
+  "location": "Noida, Uttar Pradesh, India",
   "grad_year": 2027,
   "fulltime_available_from": "2026-12-15",
+  "hours_per_week_available": "15-20 during semester",
+
   "want_roles": [
-    "AI/ML Engineer", "Machine Learning Engineer", "AI Engineer", "ML Engineer",
-    "Machine Learning Intern", "AI Intern", "Deep Learning Engineer",
-    "ML Research Intern", "Data Scientist", "Data Analyst",
-    "Software Engineer", "Software Developer", "Backend Engineer",
-    "Full Stack Developer", "Computer Vision Engineer", "NLP Engineer",
-    "GenAI Engineer", "LLM Engineer", "AI/ML Intern", "SDE Intern"
+    "AI/ML Intern", "AI Engineer Intern", "Machine Learning Intern",
+    "Software Developer Intern", "AI Intern", "ML Engineer Intern",
+    "Machine Learning Engineer Entry Level", "Artificial Intelligence Intern",
+    "Generative AI Intern", "GenAI Intern", "LLM Intern", "RAG Intern",
+    "Data Science Intern", "Python Developer Intern", "Backend Developer Intern",
+    "Software Engineer Fresher", "Software Developer Fresher",
+    "Associate Software Engineer", "Graduate Software Engineer",
+    "Junior ML Engineer", "Junior AI Engineer", "Entry-Level AI Engineer",
+    "Entry-Level Software Engineer", "Python Developer"
   ],
+
   "have_skills": [
-    "Python", "C++", "Java", "JavaScript", "SQL", "Git", "Machine Learning",
-    "Deep Learning", "PyTorch", "TensorFlow", "scikit-learn", "Pandas", "NumPy",
-    "NLP", "Computer Vision", "LLM", "Data Structures", "Algorithms",
-    "HTML/CSS", "React", "REST API"
+    "Python", "C++", "Java", "C", "SQL",
+    "Scikit-learn", "Scikit learn", "Pandas", "NumPy",
+    "Exploratory Data Analysis", "Data Preprocessing", "Feature Engineering",
+    "Model Evaluation", "Classification", "Supervised Learning",
+    "FastAPI", "REST API", "API Validation",
+    "MySQL",
+    "Git", "GitHub", "VS Code",
+    "Object-Oriented Programming", "Data Structures", "Algorithms",
+    "Streamlit", "Logistic Regression", "Random Forest",
+    "Machine Learning", "Debugging"
   ],
+
   "missing_skills": [
-    "AWS", "Docker", "Kubernetes", "Spark", "Kafka", "Golang", "Rust",
-    "Scala", "LangChain", "MLOps", "Airflow"
+    "PyTorch", "TensorFlow", "Keras", "LangChain", "RAG",
+    "Computer Vision", "Deep Learning", "NLP", "LLM", "Transformers",
+    "AWS", "Docker", "Kubernetes", "Spark", "Hadoop", "MLOps", "Airflow",
+    "Go", "Rust", "Scala", "Kafka", "MongoDB", "PostgreSQL", "Redis",
+    "Node.js", "TypeScript", "React", "Android", "Flutter", "DevOps", "Linux"
   ],
+
+  "projects": [
+    {"name": "Cricket Performance Analysis and Live Match Prediction",
+     "stack": ["Python", "Pandas", "NumPy", "Scikit-learn", "Streamlit", "Logistic Regression", "Random Forest"],
+     "note": "IPL 2013-2026 data; accuracy 49% to 73.27%; live match prediction dashboard"},
+    {"name": "Student Performance Analyser",
+     "stack": ["Python", "FastAPI", "REST API"],
+     "note": "marks processing, grade generation, pass/fail prediction, input validation"}
+  ],
+
+  "experience": [
+    "Tech Volunteer - Creativity & Innovation Cell in Electronics (CICE), JIIT (2025-2026)",
+    "DSA: 25+ problems on LeetCode & GeeksforGeeks (arrays, recursion, basic algorithms)"
+  ],
+
+  "location_priority": ["Noida", "Greater Noida", "Delhi", "Delhi NCR", "Gurugram", "Gurgaon",
+                         "Remote India", "India", "Remote worldwide (India-eligible)"],
+
   "major_companies": [
-    "Google", "Microsoft", "Amazon", "Meta", "Apple", "Netflix", "NVIDIA",
-    "Tesla", "OpenAI", "Anthropic", "DeepMind", "Adobe", "Salesforce",
-    "Oracle", "IBM", "Intel", "Qualcomm", "Uber", "Atlassian", "Flipkart",
-    "Swiggy", "Zomato", "Razorpay", "Zoho", "Freshworks", "Walmart",
-    "Goldman Sachs", "JPMorgan", "Morgan Stanley", "Visa", "Mastercard",
-    "Stripe", "Databricks", "Snowflake", "Palantir", "SpaceX", "Samsung",
-    "Sony", "VMware", "Broadcom", "Cisco", "SAP", "Perplexity", "Mistral"
+    "Google", "Microsoft", "Amazon", "Meta", "Apple", "Netflix", "NVIDIA", "Tesla",
+    "OpenAI", "Anthropic", "DeepMind", "Adobe", "Salesforce", "Oracle", "IBM",
+    "Intel", "Qualcomm", "Uber", "Atlassian", "Flipkart", "Swiggy", "Zomato",
+    "Razorpay", "Zoho", "Freshworks", "Walmart", "Goldman Sachs", "JPMorgan",
+    "Morgan Stanley", "Visa", "Mastercard", "Stripe", "Databricks", "Snowflake",
+    "Samsung", "Cisco", "SAP", "Perplexity", "Mistral", "Cohere", "Groq",
+    "Yahoo", "Quora", "Sprinklr", "MPL", "Meesho", "Unacademy", "PhonePe", "Paytm",
+    "CRED", "Zepto", "Rapido", "Google DeepMind", "American Express"
   ]
 }
