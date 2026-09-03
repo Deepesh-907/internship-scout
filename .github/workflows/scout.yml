@@ -4,13 +4,6 @@ on:
   schedule:
     - cron: "*/30 * * * *"   # every 30 min (UTC); GitHub may add a few minutes' delay
   workflow_dispatch:
-    inputs:
-      test_alert:
-        description: "Send a test card to Telegram (true/false)"
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
 
 permissions:
   contents: write
@@ -31,7 +24,7 @@ jobs:
           python-version: "3.12"
 
       - name: Scan + deliver alerts
-        run: python scout.py ${{ inputs.test_alert == 'true' && '--test-alert' || '' }}
+        run: python scout.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

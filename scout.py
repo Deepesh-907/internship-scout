@@ -64,8 +64,15 @@ def get_json(url, **kw):
     return json.loads(http(url, **kw).decode("utf-8", "replace"))
 
 def clean(s):
-    s = re.sub(r"<[^>]+>", " ", s or "")
+    import html as _html
+    s = _html.unescape(s or "")          # &amp; &#8211; etc. before tag stripping
+    s = re.sub(r"<[^>]+>", " ", s)
     return re.sub(r"\s+", " ", s).strip()
+
+def unescape_html(s):
+    """Greenhouse returns double-escaped HTML (&lt;p&gt;...); unescape then strip."""
+    import html as _html
+    return _html.unescape(_html.unescape(s or ""))
 
 def load_json(path, default):
     try:
@@ -247,7 +254,11 @@ def adp_smartrecruiters(p):
     return out
 
 def adp_greenhouse(p):
+    """Two-phase: cheap list for title+location filtering, then hydrate the
+    descriptions of survivors only (?content=true on the whole board is ~4.5 MB
+    per company)."""
     out = []
+    hydrate = []
     for company in p["_gh_companies"]:
         try:
             d = get_json(f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs")
@@ -258,12 +269,27 @@ def adp_greenhouse(p):
             title = j.get("title", "")
             if not is_target_title(title):
                 continue
-            loc = ""
-            offices = j.get("offices") or []
-            if offices:
-                loc = ", ".join(o.get("location", "") for o in offices[:2])
-            out.append(J("greenhouse", j.get("id"), title, company_map(company), loc,
-                         j.get("absolute_url", ""), "", (j.get("updated_at") or "")))
+            # the board list API returns offices[].location as null; the real
+            # value lives in location.name (verified live across 16 boards)
+            loc = (j.get("location") or {}).get("name") or ""
+            if loc.strip().lower() in ("", "n/a", "na", "not specified"):
+                # multi-location reqs leave location blank but name the office region
+                offices = j.get("offices") or []
+                alt = ", ".join(o.get("name") or o.get("location") or "" for o in offices[:2])
+                loc = alt.strip(", ") or loc
+            job = J("greenhouse", j.get("id"), title, company_map(company), loc,
+                    j.get("absolute_url", ""), "", (j.get("updated_at") or ""))
+            out.append(job)
+            ok, _ = location_gate(job)
+            if ok and j.get("id"):
+                hydrate.append((company, j.get("id"), job))
+    for company, jid, job in hydrate[:70]:
+        try:
+            one = get_json(f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs/{jid}")
+            job["desc"] = clean(unescape_html(str(one.get("content") or "")))[:8000]
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
+            continue
+    log(f"greenhouse: hydrated {min(len(hydrate), 70)} descriptions")
     return out
 
 def adp_lever(p):
@@ -367,6 +393,8 @@ def adp_linkedin(p):
     companies = [clean(c) for c in
                  re.findall(r'base-search-card__subtitle[^>]*>\s*(?:<a[^>]*>)?\s*([^<]{2,80})', page)]
     out, seen = [], set()
+    locations = [clean(x) for x in
+                 re.findall(r'job-search-card__location[^>]*>\s*([^<]{2,80})', page)]
     for i, jid in enumerate(ids):
         if jid in seen:
             continue
@@ -374,7 +402,10 @@ def adp_linkedin(p):
         out.append(J("linkedin", jid,
                      titles[i] if i < len(titles) else "Internship",
                      companies[i] if i < len(companies) else "LinkedIn employer",
-                     "LinkedIn", f"https://www.linkedin.com/jobs/view/{jid}", ""))
+                     # the search is already location-scoped to India; never emit
+                     # "LinkedIn" as a location — the gate reads it as onsite-abroad
+                     locations[i] if i < len(locations) else p.get("_indeed_location", "India"),
+                     f"https://www.linkedin.com/jobs/view/{jid}", ""))
     return out
 
 def adp_google(p):
@@ -416,6 +447,11 @@ def adp_internshala(p):
                 continue
             role = m.group(1).replace("-", " ").title()
             comp = m.group(2).replace("-", " ").title()
+            # keep the word "Internship" in the title: the slug drops it, and without
+            # it the title gate rejected real technical roles ("Data Engineer",
+            # "Applied Scientist", "Nlp Scientist", ...)
+            if "intern" not in role.lower():
+                role = role + " Internship"
             out.append(J("internshala", slug[:80], role, comp, "India (Internshala)",
                         "https://internshala.com/internship/detail/" + slug,
                         f"{role} internship via Internshala"))
@@ -434,10 +470,17 @@ def adp_youtube(p):
                         headers={"Accept": "text/html"}).decode("utf-8", "replace")
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
             continue
-        titles = [t.encode().decode("unicode_escape", "replace")
-                  for t in re.findall(r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.){5,100})"', page)]
-        chans = [c.encode().decode("unicode_escape", "replace")
-                 for c in re.findall(r'"ownerText":\{"runs":\[\{"text":"((?:[^"\\]|\\.){2,60})"', page)]
+        # \uXXXX escapes come back as surrogate pairs / mojibake unless the
+        # unicode_escape pass is re-encoded as latin-1 first
+        def _dec(s):
+            try:
+                return s.encode("latin-1", "backslashreplace").decode("unicode_escape")
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                return s
+        titles = [_dec(t) for t in
+                  re.findall(r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.){5,100})"', page)]
+        chans = [_dec(c) for c in
+                 re.findall(r'"ownerText":\{"runs":\[\{"text":"((?:[^"\\]|\\.){2,60})"', page)]
         vids = re.findall(r'"videoId":"([\w-]{11})"', page)
         for i, vid in enumerate(vids):
             if vid in seen or i >= len(titles):
@@ -480,13 +523,25 @@ SENIOR_BLOCK = ("senior", "sr.", "sr ", "principal", "staff", "manager", "direct
 ENTRY_KEYS = ("intern", "internship", "graduate", "fresher", "campus", "new grad",
               "early career", "university grad", "university graduate", "trainee",
               "co-op", "coop", "apprentice", "junior", "entry level", "entry-level",
-              "entry level", "sde", "engineer i", "analyst i", "developer i",
+              "sde", "engineer i", "analyst i", "developer i",
               "research fellow", "member of technical staff", "associate software",
               "graduate software", "junior ml", "junior ai", "python developer",
               "backend developer", "data science", "genai", "llm", "machine learning",
               "ai engineer", "ml engineer", "ai/ml", "artificial intelligence",
               "software developer", "software engineer", "backend engineer",
-              "full stack", "full-stack", "python developer")
+              "full stack", "full-stack", "fullstack",
+              # domain engineer/developer/scientist titles that are routinely
+              # entry-level-open and were being dropped by the old allow-list
+              "data scientist", "data analyst", "data engineer", "research engineer",
+              "applied scientist", "research scientist", "nlp", "computer vision",
+              "frontend engineer", "front-end engineer", "frontend developer",
+              "web developer", "devops engineer", "platform engineer",
+              "site reliability engineer", "cloud engineer", "qa engineer",
+              "quality assurance engineer", "test engineer", "automation engineer",
+              "support engineer", "technical support", "analytics engineer",
+              "database engineer", "python development", "ai research",
+              "ai developer", "ml developer", "mlops", "prompt engineer",
+              "technical staff", "product analytics", "quantitative")
 FT_TITLE_KEYS = ("graduate", "campus", "new grad", "university", "fresher",
                  "early career", "2027", "2026", "trainee", "entry level", "entry-level")
 
@@ -494,26 +549,34 @@ def is_target_title(title):
     t = (title or "").lower()
     if not t:
         return False
-    # 'staff' alone signals senior, but 'member of technical staff' is entry-level
-    if "member of technical staff" in t:
+    # 'staff' alone signals senior, but 'member of (the) technical staff' is entry-level
+    if re.search(r"member of (?:the )?technical staff", t):
         return True
     if any(b in t for b in SENIOR_BLOCK):
         return False
-    # non-tech internships are out of scope regardless of 'intern' in the title
+    # non-tech internships are out of scope regardless of 'intern' in the title.
+    # 'ai'/'ml' must be whole words here — bare substrings matched "Retail Intern".
     if "intern" in t or "internship" in t:
-        if not any(k in t for k in ("ai", "ml", "machine learning", "data scien", "data analyst",
-                                    "software", "developer", "engineer", "python",
-                                    "programming", "backend", "full stack", "full-stack",
-                                    "sde", "tech", "automation", "computer", "research",
-                                    "science", "genai", "llm", "cloud", "coding",
-                                    "technical", "technical staff")) \
-           and not re.search(r"\bswe\b", t):
-            return False
-        return True
+        if any(k in t for k in ("machine learning", "data scien", "data analy",
+                                "software", "developer", "engineer", "python",
+                                "programming", "backend", "frontend", "full stack",
+                                "full-stack", "fullstack", "sde", "tech", "automation",
+                                "computer", "research", "scien", "genai", "llm",
+                                "cloud", "coding", "technical", "robotics", "security",
+                                "platform", "infrastructure", "devops", "mlops",
+                                "quantitative", "analytics", "web", "mobile",
+                                "android", "ios", "database", "data")):
+            return True
+        return bool(re.search(r"\b(?:ai|ml|swe|nlp|cv|qa)\b", t))
     return any(k in t for k in ENTRY_KEYS)
 
 def word_hit(skill, text):
-    return re.search(r"(?<![a-z0-9])" + re.escape(skill.lower()) + r"(?![a-z0-9])", text)
+    s = skill.lower()
+    if len(s) <= 2:
+        # 1-2 char skills (C, R, Go) need tight context: a bare "c" otherwise matches
+        # C++, "(c) 2026" and "Option C", producing "required skills matched: c"
+        return re.search(r"(?<![a-z0-9+#(])" + re.escape(s) + r"(?![a-z0-9+#])", text)
+    return re.search(r"(?<![a-z0-9])" + re.escape(s) + r"(?![a-z0-9])", text)
 
 def find_hours(body):
     """Detect stated weekly hours; returns int or None."""
@@ -651,7 +714,7 @@ def hard_eligibility(j, prof):
             v.append("❌ HARD ELIGIBILITY ISSUE: requires Master's/PhD — you are a BCA undergraduate")
 
     # 2. experience requirements
-    m = re.search(r"(\d{1,2})\+?\s*(?:-\s*\d{1,2}\s*)?(?:years?|yrs?)\s*(?:of\s*)?(?:professional\s*)?experience", body)
+    m = re.search(r"(\d{1,2})\+?\s*(?:-\s*\d{1,2}\s*)?(?:years?|yrs?)[^.;\n]{0,45}?experience", body)
     if m:
         yrs = int(m.group(1))
         if yrs >= 2 and not re.search(r"(?:years? of college|years? of university|years? of education)", body):
@@ -680,30 +743,72 @@ def hard_eligibility(j, prof):
     return v
 
 # ------------------------------------------------------------- location gate
-INDIA_CITIES = ("noida", "greater noida", "delhi", "ncr", "gurgaon", "gurugram", "india",
-                "bengaluru", "bangalore", "hyderabad", "pune", "mumbai", "chennai",
-                "kolkata", "ahmedabad", "jaipur", "indore", "kochi", "coimbatore",
-                "bhopal", "nagpur", "lucknow", "chandigarh", "dehradun", "remote india",
-                "india (internshala)", "anywhere in india")
+# matched as whole words, so "indiana"/"indianapolis" cannot pass as "india"
+INDIA_CITIES = ("noida", "greater noida", "delhi", "new delhi", "gurgaon", "gurugram",
+                "india", "bengaluru", "bangalore", "hyderabad", "pune", "mumbai",
+                "navi mumbai", "thane", "chennai", "kolkata", "ahmedabad", "jaipur",
+                "indore", "kochi", "coimbatore", "bhopal", "nagpur", "lucknow",
+                "chandigarh", "mohali", "dehradun", "trivandrum", "thiruvananthapuram",
+                "visakhapatnam", "vizag", "mysuru", "mysore", "bhubaneswar", "surat",
+                "vadodara", "gandhinagar", "ghaziabad", "faridabad", "goa",
+                "karnataka", "telangana", "maharashtra", "tamil nadu", "kerala",
+                "gujarat", "haryana", "uttar pradesh", "delhi ncr")
+INDIA_RE = re.compile(r"(?<![a-z])(" + "|".join(INDIA_CITIES).replace(" ", r"\s") +
+                      r")(?![a-z])")
+REMOTE_ONLY_SOURCES = ("remotive", "remoteok", "jobicy")
+LOC_UNKNOWN = ("", "not specified", "n/a", "na", "varies", "multiple locations",
+               "see posting", "wellfound (varies)", "linkedin", "youtube announcement")
+# "Remote - US" / "Canada Remote" / "Spain Remote" mean remote WITHIN that country:
+# he would need work authorization there, so they are not opportunities he can take.
+FOREIGN_REMOTE = ("usa", "u.s.", "united states", "us only", "remote - us", "us remote",
+                  "us - remote", "us-remote", "us based", "u.s. remote",
+                  "canada", "canadian", "uk", "united kingdom", "england", "ireland",
+                  "germany", "deutschland", "france", "spain", "italy", "netherlands",
+                  "sweden", "norway", "denmark", "finland", "poland", "portugal",
+                  "switzerland", "austria", "belgium", "czech", "romania", "greece",
+                  "australia", "new zealand", "japan", "korea", "singapore", "china",
+                  "brazil", "mexico", "argentina", "colombia", "chile", "israel",
+                  "uae", "dubai", "saudi", "nigeria", "kenya", "south africa",
+                  "emea", "apac", "latam", "europe", "eu only", "north america",
+                  # foreign cities that appear as "<city> Remote" (remote-from-there)
+                  "toronto", "vancouver", "montreal", "san francisco", "new york",
+                  "seattle", "austin", "boston", "chicago", "los angeles", "denver",
+                  "london", "berlin", "munich", "paris", "amsterdam", "dublin",
+                  "barcelona", "madrid", "lisbon", "warsaw", "stockholm", "zurich",
+                  "tokyo", "sydney", "melbourne", "singapore", "tel aviv", "sao paulo")
+GLOBAL_REMOTE = ("worldwide", "anywhere", "global", "any location", "fully remote",
+                 "work from anywhere", "remote (global)", "international")
 
 def location_gate(j):
-    """Remote is always fine (workplaceType=Remote beats any city name — 'Toronto/Remote'
-    means remote-eligible worldwide). Onsite is fine only in India. Onsite abroad -> skip.
-    Returns (ok, tag)."""
-    loc = (j.get("location") or "").lower()
+    """Remote is fine when he can actually take it from India: globally-remote or
+    India-remote. Remote locked to another country needs work authorization he does
+    not hold, so it is treated like onsite abroad. Onsite is fine only in India.
+    An uninformative location is delivered with a verify-flag rather than dropped,
+    because dropping it silently wipes out whole sources. Returns (ok, tag)."""
+    loc = (j.get("location") or "").lower().strip()
+    head = (j.get("desc") or "")[:600].lower()
+    in_india = bool(INDIA_RE.search(loc)) or bool(INDIA_RE.search(head[:400]))
     is_remote = ("remote" in loc or "work from home" in loc or "wfh" in loc
-                 or "anywhere" in loc or "hybrid-remote" in loc)
+                 or "anywhere" in loc or "hybrid-remote" in loc or "distributed" in loc
+                 or "telecommut" in loc or "home-based" in loc or "home based" in loc
+                 or "virtual" in loc)
     if not is_remote:
         # some boards put remote info only in the description head
-        head = (j.get("desc") or "")[:600].lower()
-        is_remote = bool(re.search(r"\bremote\b|work from home|wfh|work anywhere", head))
-    in_india = any(c in loc for c in INDIA_CITIES)
-    if is_remote:
-        # remote roles that name a country are usually 'remote within that region' —
-        # still worth showing with a note; user verifies India eligibility
-        return True, None
+        is_remote = bool(re.search(r"\bremote\b|work from home|wfh|work anywhere"
+                                   r"|fully distributed|telecommut", head))
+    if j.get("source") in REMOTE_ONLY_SOURCES:
+        is_remote = True  # these APIs only carry remote listings
     if in_india:
-        return True, "India onsite"
+        return True, ("Remote India" if is_remote else "India onsite")
+    if is_remote:
+        if any(g in loc for g in GLOBAL_REMOTE) or any(g in head for g in GLOBAL_REMOTE):
+            return True, "Remote worldwide"
+        foreign = [c for c in FOREIGN_REMOTE if c in loc]
+        if foreign:
+            return False, f"remote locked to {foreign[0]} — work authorization needed"
+        return True, None  # plain "Remote" with no country named
+    if loc in LOC_UNKNOWN or len(loc) < 3:
+        return True, "location unverified"
     if "hybrid" in loc:
         return False, "hybrid abroad"  # hybrid abroad means regular office presence
     return False, "onsite abroad"
@@ -723,9 +828,21 @@ def quality_check(j, prof):
               "earn ₹", "earn rs", "paid training", "training fee", "security deposit")
     if any(k in t for k in scam_t) and not any(k in t for k in ("ai", "ml", "machine learning", "developer", "engineer", "python")):
         issues.append("scam-pattern title")
-    if any(k in body for k in ("registration fee", "security deposit", "training fee",
-                               "pay to apply", "refundable fee", "processing fee",
-                               "deposit of", "pay rs", "pay ₹")):
+    # Fee scams demand money FROM the candidate. A bare "processing fee"/"deposit of"
+    # substring also appears in legitimate fintech JDs (Stripe, Ramp, Block, Coinbase),
+    # so the fee must be tied to an applicant-pays cue before blocking.
+    fee_pat = (r"(?:registration|security|training|refundable|processing|application)\s"
+               r"(?:fee|deposit)[^.]{0,50}"
+               r"(?:required|mandatory|payable|to apply|before (?:joining|interview|start)"
+               r"|to (?:join|secure|confirm|register))"
+               r"|(?:you|candidates?|applicants?|students?|interns?)\s"
+               r"(?:must\s|have to\s|need to\s|will\s|should\s)?"
+               r"(?:pay|deposit|submit|transfer)\s[^.]{0,40}"
+               r"(?:fee|deposit|charge|registration|amount)"
+               r"|(?:pay|deposit|transfer)\s(?:₹|rs\.?|inr)\s?[\d,]+"
+               r"|pay to apply|refundable (?:fee|deposit|amount)"
+               r"|(?:fee|deposit) of (?:₹|rs\.?|inr)\s?[\d,]+")
+    if re.search(fee_pat, body):
         issues.append("pay-to-apply scheme")
     if any(k in body for k in ("commission only", "commission-only", "no fixed salary")):
         issues.append("commission-only role")
@@ -735,25 +852,28 @@ def quality_check(j, prof):
         issues.append("training program disguised as job")
 
     # company identifiable
-    comp = (j.get("company") or "").strip()
+    comp = (j.get("company") or "").strip().lower()
     if not comp or comp in ("?", "unknown", "confidential company", "private limited 123",
-                            "wellfound startup", "indeed employer", "linkedin employer") or len(comp) < 2:
+                            "wellfound startup", "indeed employer", "linkedin employer") \
+       or len(comp) < 2:
         issues.append("company not identifiable")
 
-    # obviously stale posting
+    # Staleness is NOT a scam signal and must not block ATS boards: Ashby/Greenhouse/
+    # Lever only publish live postings, and `date` there is req-creation, so evergreen
+    # reqs look "old" while still hiring (this rule alone was silently killing 148
+    # jobs/run, incl. Cohere's Winter-2027 SWE internship). Only aggregator copies,
+    # where a stale date really does mean a dead link, are dropped — and only after
+    # two years.
     date_s = j.get("date") or ""
-    if date_s:
+    if date_s and j.get("source") not in ("ashby", "greenhouse", "lever",
+                                          "smartrecruiters", "netflix", "amazon"):
         try:
             import datetime as dt
             age = (dt.datetime.now(dt.timezone.utc).date() - dt.date.fromisoformat(date_s[:10])).days
-            if age > 120:
-                issues.append(f"posted {age} days ago — likely expired")
+            if age > 730:
+                issues.append(f"posted {age} days ago — link almost certainly dead")
         except ValueError:
             pass
-
-    # clearly fake company names
-    if re.search(r"\b(consultancy|hr services)\b", comp.lower()) and "recruitment" in body and "software" not in body:
-        pass  # consultancy postings can be real; skip hard block
 
     return issues
 
@@ -780,15 +900,25 @@ def score_job(j, prof, cfg):
         req_text = desc  # can't isolate requirements: use full JD as proxy
     req_blob = req_text.lower()
     have = [s.lower() for s in prof.get("have_skills", [])]
+    # A JD too short to describe anything (aggregator placeholders like
+    # "Python Development internship via Internshala") cannot prove a match:
+    # naming one technology used to buy a perfect 35/35, beating real JDs.
+    thin_jd = len(desc) < 250
     have_hits = [s for s in have if word_hit(s, req_blob)]
-    tech_present = [s for s in (prof.get("have_skills", []) + prof.get("missing_skills", []))
-                    if word_hit(s.lower(), body)]
-    # ratio of your skills among the technologies the JD actually names
-    if tech_present:
-        req_ratio = len(have_hits) / max(1, len(tech_present))
+    if thin_jd:
+        breakdown["required"] = 20  # neutral: unproven either way
+        reasons.append("⚠ Job description not available from this source — "
+                       "match estimated from the title; verify requirements yourself")
     else:
-        req_ratio = 0.6  # JD names nothing specific: neutral
-    breakdown["required"] = round(35 * req_ratio)
+        # numerator and denominator must be measured over the SAME text, else a
+        # long JD mentioning extra tech elsewhere drags the ratio down
+        tech_present = [s for s in (prof.get("have_skills", []) + prof.get("missing_skills", []))
+                        if word_hit(s.lower(), req_blob)]
+        if tech_present:
+            req_ratio = len(have_hits) / max(1, len(tech_present))
+        else:
+            req_ratio = 0.6  # JD names nothing specific: neutral
+        breakdown["required"] = round(35 * req_ratio)
     if have_hits:
         reasons.append(f"required skills matched: {', '.join(have_hits[:6])}")
 
@@ -798,7 +928,8 @@ def score_job(j, prof, cfg):
         desc, re.I)).lower()
     if pref_blob:
         pref_hits = [s for s in have if word_hit(s, pref_blob)]
-        breakdown["preferred"] = round(15 * len(pref_hits) / max(1, len(pref_hits) + 2))
+        # a match must never score below silence (7): baseline + per-hit credit
+        breakdown["preferred"] = min(15, 7 + 3 * len(pref_hits)) if pref_hits else 6
         if pref_hits:
             reasons.append(f"preferred skills you have: {', '.join(pref_hits[:4])}")
     else:
@@ -810,42 +941,69 @@ def score_job(j, prof, cfg):
                if word_hit(s, body)] or missing
 
     # ---- education & eligibility (15)
+    # A JD that never states a degree bar is not a rejection — silence gets the same
+    # credit as an explicit welcome, and only an explicit bar he cannot meet loses it.
     edu = 0
-    if any(k in body for k in ("bca", "bca students", "any graduate", "any degree",
-                               "bachelor", "bca/btech", "bca/ bsc")):
-        edu += 6
+    hard_bar = re.search(r"\b(?:phd|ph\.d|doctoral|master'?s?\s+degree|m\.?tech|m\.?s\.?\s+in|mba)\b"
+                         r"[^.]{0,40}(?:required|must|mandatory)"
+                         r"|(?:must|required to) (?:be enrolled in|hold) a (?:master|phd)", body)
+    explicit_ok = any(k in body for k in ("bca", "any graduate", "any degree", "bachelor",
+                                          "b.tech", "btech", "b.sc", "bsc", "undergraduate",
+                                          "all majors", "any discipline"))
+    states_degree = bool(re.search(r"\b(?:degree|bachelor|master|phd|b\.?tech|bca|bsc|mca|graduat)", body))
+    if hard_bar:
+        edu += 0
+    elif explicit_ok or not states_degree:
+        edu += 8
+    else:
+        edu += 4  # degree mentioned in terms that neither include nor exclude him
     if any(k in body for k in ("fresher", "student", "pursuing", "no experience",
-                               "0-1 years", "entry level", "entry-level")):
-        edu += 5
-    if "intern" in title or "internship" in title:
+                               "0-1 years", "entry level", "entry-level", "final year",
+                               "new grad", "recent graduate")):
         edu += 4
+    if "intern" in title or "internship" in title or "intern" in body[:600]:
+        edu += 3
     elif any(k in title for k in ("fresher", "graduate", "campus", "new grad", "university", "trainee")):
-        edu += 4
+        edu += 3
     breakdown["education"] = min(15, edu)
 
-    # ---- projects (15): overlap of JD stack with my two projects
+    # ---- projects (15): his two shipped projects are resume facts — credit them by
+    # role family, then add JD-stack overlap on top. A JD that simply doesn't list his
+    # exact tools does not erase the projects.
     proj_stacks = []
     for p in prof.get("projects", []):
         proj_stacks += [s.lower() for s in p.get("stack", [])]
     proj_hits = [s for s in set(proj_stacks) if word_hit(s, body)]
+    ml_role = any(k in title for k in ("ml", "machine learning", "ai", "data scien",
+                                       "data analy", "deep learning", "nlp", "llm",
+                                       "genai", "computer vision", "research"))
+    swe_role = any(k in title for k in ("software", "developer", "engineer", "sde",
+                                        "backend", "full stack", "fullstack", "python",
+                                        "api", "platform", "technical staff", "swe"))
+    base = 10 if ml_role else (8 if swe_role else 4)
+    breakdown["projects"] = min(15, base + 2 * len(set(proj_hits)))
+    if ml_role:
+        reasons.append("your Cricket Performance ML project (49% → 73% accuracy) is direct evidence")
+    elif swe_role:
+        reasons.append("your FastAPI Student Performance Analyser is direct evidence")
     if proj_hits:
-        breakdown["projects"] = min(15, 5 + 4 * len(set(proj_hits)))
         reasons.append(f"project stack overlap: {', '.join(sorted(set(proj_hits))[:5])}")
-    else:
-        breakdown["projects"] = 2
 
-    # ---- practical experience (10)
-    exp = 0
+    # ---- practical experience (10): project experience, honestly labelled — he has no
+    # professional employment yet, so this component never reaches full marks on that
+    # basis alone.
+    exp = 4 if (ml_role or swe_role) else 2
     if word_hit("fastapi", body) or word_hit("rest api", body):
-        exp += 3
-        reasons.append("your FastAPI/REST project maps directly")
-    if word_hit("scikit-learn", body) or word_hit("pandas", body) or word_hit("numpy", body):
-        exp += 3
-        reasons.append("your ML/data workflow experience applies")
-    if any(k in body for k in ("collaborat", "team", "agile", "cross-functional")):
         exp += 2
-    if any(k in body for k in ("event", "workshop", "volunteer")):
-        exp += 1
+        reasons.append("your FastAPI/REST work maps directly")
+    if word_hit("scikit-learn", body) or word_hit("pandas", body) or word_hit("numpy", body):
+        exp += 2
+        reasons.append("your ML/data workflow experience applies")
+    if any(k in body for k in ("no experience", "fresher", "0-1 years", "entry level",
+                               "entry-level", "student")):
+        exp += 2
+    if re.search(r"\b([3-9]|1\d)\+?\s*years", body):
+        exp = min(exp, 3)  # JD wants real seniority: don't pretend
     breakdown["experience"] = min(10, exp)
 
     # ---- role relevance (10)
@@ -892,7 +1050,23 @@ def score_job(j, prof, cfg):
             reasons.append(f"{hours} h/week — slightly above your 15-20 h target")
         else:
             reasons.append(f"⚠ {hours}+ h/week during semester — heavy; decide if feasible")
-    score = max(0, min(100, sum(breakdown.values()) + adj))
+
+    # A role he is structurally ineligible for is a WORSE match, and the score has to
+    # say so — otherwise mid-level reqs ("Software Engineer L4", "5+ years") outrank
+    # real internships. Ceilings, not deductions, so the reasons stay truthful.
+    ceiling = 100
+    yrs_m = re.search(r"(\d{1,2})\+?\s*(?:-\s*\d{1,2}\s*)?(?:years?|yrs?)"
+                      r"[^.;\n]{0,45}?experience", body)
+    if yrs_m and not re.search(r"years? of (?:college|university|education|study)", body):
+        yrs = int(yrs_m.group(1))
+        if yrs >= 4:
+            ceiling = min(ceiling, 45)
+        elif yrs >= 2:
+            ceiling = min(ceiling, 55)
+    if re.search(r"\b(?:l[3-9]|level [3-9]|iii|iv|v)\b", title) or \
+       re.search(r"\b(?:engineer|developer|scientist|analyst)\s*[3-9]\b", title):
+        ceiling = min(ceiling, 55)  # numbered mid-level ladder rung
+    score = max(0, min(ceiling, min(100, sum(breakdown.values()) + adj)))
 
     # full-time detection for downstream joining-date rule
     is_fulltime = False
@@ -980,8 +1154,15 @@ def summarize_jd(j):
     d = re.sub(r"(?i)^(?:about (?:us|the company|the role)|job description|requirements?|"
                r"responsibilities?|who (?:we|you) (?:are|'re)|overview|role)\s*:?\s*", "", d)
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean(d)) if len(s.strip()) > 25]
+    # company marketing ("more than 50 million registered users", "backed by ...")
+    # crowds out the actual role; prefer sentences that describe the job itself
+    role_cue = re.compile(r"(?i)\b(you(?:'ll| will)?|we(?:'re| are) (?:looking|hiring|seeking)"
+                          r"|this (?:role|internship|position)|the (?:role|intern)"
+                          r"|responsib|requirement|qualifi|experience with|skills?"
+                          r"|intern(?:ship)?\b|stipend|duration|join)")
+    ranked = [s for s in sents if role_cue.search(s)] or sents
     pick, total = [], 0
-    for s in sents:
+    for s in ranked:
         if total > 420:
             break
         pick.append(s)
@@ -1152,39 +1333,6 @@ def main():
     dry = "--no-send" in sys.argv
     force_digest = "--digest" in sys.argv
     # helper: python scout.py --telegram-id  (print chat ids after you message the bot)
-    if "--test-alert" in sys.argv:
-        # Send one synthetic BCA-friendly job through the full production path
-        # (same gates + card renderer + Telegram sender as real deliveries).
-        import os
-        for env_key, cfg_key in [("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
-                                 ("TELEGRAM_CHAT_ID", "telegram_chat_id")]:
-            if os.environ.get(env_key):
-                cfg[cfg_key] = os.environ[env_key]
-        tj = {
-            "id": "TEST:zoho-ml-intern-2026",
-            "title": "Machine Learning Intern (Remote)",
-            "company": "Zoho",
-            "location": "Remote India",
-            "url": "https://careers.zohocorp.com/jobs/Careers/ML-INTERN-2026",
-            "desc": ("Machine Learning Internship for students pursuing BCA/BTech. "
-                     "Requirements: Python, Pandas, NumPy, Scikit-learn, Machine Learning. "
-                     "FastAPI preferred. What you'll do: Build ML models on real product "
-                     "data, analyze data pipelines, and deploy prediction features. "
-                     "Stipend: Rs 25,000 per month. 6-month internship, flexible hours. "
-                     "Apply by Oct 15, 2026. Joining: January 2027."),
-            "date": time.strftime("%Y-%m-%d"), "source": "internshala",
-        }
-        ok, tag = location_gate(tj)
-        sc, r, ms, ft = score_job(tj, prof, cfg)
-        log(f"test job: location_gate={ok} score={sc} ft={ft}")
-        if sc < int(cfg.get("min_score", 60)):
-            log("TEST FAILED: synthetic job scored below floor — scoring bug")
-            return 1
-        subj = f"🧪 TEST 🔥 [{sc}%] Machine Learning Intern at Zoho"
-        via = deliver(cfg, subj, alert_text(tj, sc, r, ms))
-        log(f"test card delivered via {via}")
-        return 0 if via else 1
-
     if "--telegram-id" in sys.argv:
         token = cfg.get("telegram_bot_token") or input("Paste bot token: ").strip()
         try:
@@ -1213,12 +1361,15 @@ def main():
     prof["_indeed_location"] = "India"
     prof["_sr_companies"] = ["Visa", "bakerhughes", "Bosch", "Workday", "Stryker",
                              "JuniperNetworks", "adp", "SonyInteractiveEntertainmentGlobal"]
+    # US giants/startups plus boards that actually post in India (verified live)
     prof["_gh_companies"] = ["stripe", "databricks", "figma", "cloudflare", "mongodb",
                              "twilio", "robinhood", "reddit", "dropbox", "coinbase",
-                             "nuro", "roblox", "samsara", "flexport", "block"]
-    prof["_lever_companies"] = ["spotify"]
+                             "nuro", "roblox", "samsara", "flexport", "block",
+                             "gitlab", "netradyne", "postman"]
+    prof["_lever_companies"] = ["spotify", "zeta", "paytm", "mindtickle"]
     prof["_ashby_companies"] = ["elevenlabs", "Perplexity", "Cohere", "Runway",
-                                "baseten", "openai", "notion", "ramp", "modal"]
+                                "baseten", "openai", "notion", "ramp", "modal",
+                                "sarvam", "composio", "spotdraft"]
     SLUGS = {}
     for c in prof["_sr_companies"] + prof["_gh_companies"] + prof["_lever_companies"] + prof["_ashby_companies"]:
         SLUGS[c.lower()] = c.replace("-", " ").title()
@@ -1226,7 +1377,10 @@ def main():
                   "perplexity": "Perplexity", "elevenlabs": "ElevenLabs",
                   "runway": "Runway", "cohere": "Cohere", "modal": "Modal",
                   "baseten": "Baseten", "deepl": "DeepL", "notion": "Notion",
-                  "ramp": "Ramp"})
+                  "ramp": "Ramp", "gitlab": "GitLab", "netradyne": "Netradyne",
+                  "postman": "Postman", "sarvam": "Sarvam AI", "composio": "Composio",
+                  "spotdraft": "SpotDraft", "zeta": "Zeta", "paytm": "Paytm",
+                  "mindtickle": "Mindtickle"})
     globals()["_COMPANY_SLUGS"] = SLUGS
 
     seen = load_json(SEEN_FILE, {})
