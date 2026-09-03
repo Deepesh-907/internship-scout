@@ -409,21 +409,165 @@ def adp_linkedin(p):
     return out
 
 def adp_google(p):
-    """Google careers has no public JSON API; extract internship job ids from
-    the HTML app payload ('jobPost:uid:...' style keys)."""
-    page = http("https://careers.google.com/jobs/results/?target_level=INTERN&distance=50",
-                headers={"Accept": "text/html"}).decode("utf-8", "replace")
+    """Google careers: the results HTML embeds job ids and titles (no public API)."""
     out, seen = [], set()
-    for m in re.finditer(r'"(jobPost:uid:[^"]{6,40})"', page):
-        uid = m.group(1)
-        jid = uid.split(":")[-1]
-        if jid in seen:
+    for q in ("software+engineering+intern", "machine+learning+intern"):
+        try:
+            page = http("https://www.google.com/about/careers/applications/jobs/results/"
+                        f"?q={q}&location=India", headers={"Accept": "text/html"}
+                        ).decode("utf-8", "replace")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            log(f"google:{q} unreachable")
             continue
-        seen.add(jid)
-        out.append(J("google", jid, "Google Internship (see posting)", "Google",
-                     "Google offices",
-                     f"https://careers.google.com/jobs/results/{urllib.parse.quote(jid)}",
-                     "", ""))
+        # links look like /about/careers/applications/jobs/results/<id>-<slug>
+        for jid, slug in re.findall(r'jobs/results/(\d{8,})-([a-z0-9\-]{5,80})', page):
+            if jid in seen:
+                continue
+            seen.add(jid)
+            title = slug.replace("-", " ").title()
+            if not is_target_title(title):
+                continue
+            out.append(J("google", jid, title, "Google", "India",
+                         "https://www.google.com/about/careers/applications/jobs/results/"
+                         f"{jid}-{slug}", "", ""))
+        time.sleep(0.8)
+    return out
+
+def adp_workday(p):
+    """Workday-hosted career sites (Nvidia, Adobe, Salesforce, Micron, HPE, ...).
+    Two-phase: search list, then hydrate descriptions of gate-passing jobs."""
+    out, hydrate = [], []
+    for label, host, tenant, site in p["_workday_tenants"]:
+        base = f"https://{host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
+        for query in ("intern", "graduate"):
+            try:
+                raw = http(f"{base}/jobs", method="POST",
+                           data={"appliedFacets": {}, "limit": 20, "offset": 0,
+                                 "searchText": query},
+                           headers={"Content-Type": "application/json",
+                                    "Accept": "application/json"})
+                d = json.loads(raw.decode("utf-8", "replace"))
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
+                log(f"workday:{label}:{query} unreachable")
+                continue
+            for j in d.get("jobPostings") or []:
+                title = j.get("title") or ""
+                if not is_target_title(title):
+                    continue
+                path = j.get("externalPath") or ""
+                loc = j.get("locationsText") or ""
+                job = J("workday", f"{label}:{path[-40:]}", title, company_map(label), loc,
+                        f"https://{host}.myworkdayjobs.com/en-US/{site}{path}", "", "")
+                out.append(job)
+                ok, _ = location_gate(job)
+                if ok and path:
+                    hydrate.append((base, path, job))
+            time.sleep(0.25)
+    for base, path, job in hydrate[:24]:
+        try:
+            one = get_json(base + path)
+            info = one.get("jobPostingInfo") or {}
+            job["desc"] = clean(str(info.get("jobDescription") or ""))[:8000]
+            job["location"] = (info.get("location") or job["location"])
+            posted = str(info.get("startDate") or "")[:10]
+            if re.match(r"\d{4}-\d{2}-\d{2}", posted):
+                job["date"] = posted
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
+            continue
+    log(f"workday: hydrated {min(len(hydrate), 24)} descriptions")
+    return out
+
+def adp_yc(p):
+    """Y Combinator's own job board (higher weight — YC startups hire juniors and
+    remote). Role pages are server-rendered links to /companies/<co>/jobs/<id>-<slug>;
+    each job page carries a schema.org JobPosting block with the real details."""
+    out, seen = [], set()
+    for role in ("eng", "data-science", "ml", "engineering"):
+        try:
+            page = http(f"https://www.ycombinator.com/jobs/role/{role}",
+                        headers={"Accept": "text/html"}).decode("utf-8", "replace")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            log(f"yc:{role} unreachable")
+            continue
+        for path, comp_slug, job_slug in re.findall(
+                r'href="(/companies/([a-z0-9\-]+)/jobs/([^"]+))"', page):
+            if path in seen:
+                continue
+            seen.add(path)
+            title = re.sub(r"^[A-Za-z0-9_\-]{5,10}-", "", job_slug).replace("-", " ").title()
+            if not is_target_title(title):
+                continue
+            out.append(J("yc", path[-60:], title,
+                         comp_slug.replace("-", " ").title() + " (YC)",
+                         "", "https://www.ycombinator.com" + path, "", ""))
+        time.sleep(0.8)
+    # hydrate the JobPosting JSON-LD for location, description, pay and title
+    for job in out[:25]:
+        try:
+            page = http(job["url"], headers={"Accept": "text/html"}).decode("utf-8", "replace")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            continue
+        m = re.search(r'<script type="application/ld\+json">\s*(\{.*?\})\s*</script>', page, re.S)
+        if not m:
+            continue
+        try:
+            ld = json.loads(m.group(1))
+        except ValueError:
+            continue
+        job["title"] = ld.get("title") or job["title"]
+        job["desc"] = clean(str(ld.get("description") or ""))[:8000]
+        loc = ld.get("jobLocation")
+        parts = []
+        for entry in (loc if isinstance(loc, list) else [loc]):
+            addr = (entry or {}).get("address") or {} if isinstance(entry, dict) else {}
+            parts += [str(addr.get(k)) for k in ("addressLocality", "addressRegion",
+                                                 "addressCountry") if addr.get(k)]
+        if str(ld.get("jobLocationType") or "").lower().startswith("tele"):
+            parts.append("Remote")
+        job["location"] = ", ".join(dict.fromkeys(parts))[:120]
+        sal = ld.get("baseSalary") or {}
+        val = (sal.get("value") or {}) if isinstance(sal, dict) else {}
+        lo, hi = val.get("minValue"), val.get("maxValue")
+        if lo or hi:
+            cur = sal.get("currency") or "USD"
+            unit = str(val.get("unitText") or "YEAR").lower()
+            # YC's feed labels Indian salaries as USD (e.g. Bengaluru role listed as
+            # "USD 2000000-5000000/year"). Trust magnitude over the currency field.
+            try:
+                if ("in" in job["location"].lower() or "india" in job["location"].lower()) \
+                   and float(lo or hi) >= 300000 and unit.startswith("year"):
+                    cur = "INR"
+            except (TypeError, ValueError):
+                pass
+            job["desc"] += f" Compensation: {cur} {lo or ''}-{hi or ''} per {unit}."
+        posted = str(ld.get("datePosted") or "")[:10]
+        if re.match(r"\d{4}-\d{2}-\d{2}", posted):
+            job["date"] = posted
+        time.sleep(0.3)
+    return out
+
+def adp_oracle(p):
+    """Oracle Cloud recruiting API (Oracle's own openings)."""
+    out = []
+    url = ("https://eeho.fa.us2.oraclecloud.com/hcmRestApi/resources/latest/"
+           "recruitingCEJobRequisitions?onlyData=true&expand=requisitionList"
+           "&finder=findReqs;siteNumber=CX_1001,keyword=intern,limit=25")
+    try:
+        d = get_json(url)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
+        log("oracle unreachable")
+        return out
+    for item in d.get("items") or []:
+        for j in item.get("requisitionList") or []:
+            title = j.get("Title") or ""
+            if not is_target_title(title):
+                continue
+            locs = j.get("PrimaryLocation") or ""
+            out.append(J("oracle", j.get("Id"), title, "Oracle", locs,
+                         "https://careers.oracle.com/jobs/#en/sites/jobsearch/job/"
+                         + str(j.get("Id") or ""),
+                         str(j.get("ShortDescriptionStr") or ""),
+                         str(j.get("PostedDate") or "")[:10]))
     return out
 
 def adp_internshala(p):
@@ -511,7 +655,9 @@ SOURCES = [
     ("remotive", adp_remotive), ("remoteok", adp_remoteok), ("jobicy", adp_jobicy),
     ("arbeitnow", adp_arbeitnow), ("netflix", adp_netflix), ("amazon", adp_amazon),
     ("smartrecruiters", adp_smartrecruiters), ("greenhouse", adp_greenhouse),
-    ("lever", adp_lever), ("ashby", adp_ashby), ("wellfound", adp_wellfound),
+    ("lever", adp_lever), ("ashby", adp_ashby), ("workday", adp_workday),
+    ("oracle", adp_oracle), ("google", adp_google), ("yc", adp_yc),
+    ("wellfound", adp_wellfound),
     ("internshala", adp_internshala), ("indeed", adp_indeed), ("linkedin", adp_linkedin),
     ("youtube", adp_youtube),
 ]
@@ -625,6 +771,10 @@ def find_stipend(body):
             txt = clean(m.group(0))[:70]
             txt = re.sub(r"^(?:stipend|salary|compensation|pay(?:ing)?|interns? (?:are |get )?(?:paid|earn))"
                          r"[:\s]*(?:of\s+)?", "", txt, flags=re.I)
+            # a pay string with no number is boilerplate ("compensation, benefits,
+            # promotions, transfers" from EEO paragraphs), not a stipend
+            if not re.search(r"\d", txt) and not re.search(r"unpaid|not paid", txt, re.I):
+                continue
             return txt or None
     return None
 
@@ -656,14 +806,19 @@ def find_joining(j):
 def find_eligibility(j):
     """Short eligibility snippet: degree/year/pursuing requirements."""
     body = j.get("desc") or ""
-    m = re.search(r"(?:to be eligible[^.;\n]{0,40}"
-                  r"|pursuing|enrolled (?:in|with)|currently (?:in|pursuing)|"
+    m = re.search(r"(?:pursuing|enrolled (?:in|with)|currently (?:in|pursuing)|"
                   r"students?\s+(?:in|pursuing)|"
-                  r"b\.?tech|b\.\s?e\.?\b|b\.?sc\b|bachelor'?s?(?: degree)?|master'?s?(?: s)?|ph\.?d)"
-                  r"[^.|;\n]{0,110}", body, re.I)
-    if m:
-        return clean(m.group(0))[:160].rsplit(" ", 1)[0] + "…" if len(clean(m.group(0))) > 160 else clean(m.group(0))
-    return None
+                  r"b\.?tech|b\.\s?e\.?\b|b\.?sc\b|bca\b|bachelor'?s?(?: degree)?"
+                  r"|master'?s?(?: degree)?|ph\.?d)"
+                  r"[^.|;\n]{0,100}", body, re.I)
+    if not m:
+        return None
+    txt = clean(m.group(0))
+    # cut at a clause boundary so the card never shows a run-on fragment
+    txt = re.split(r"\s+(?:and|with|plus)\s+(?:experience|demonstrated|proven)", txt)[0]
+    if len(txt) > 120:
+        txt = txt[:120].rsplit(" ", 1)[0] + "…"
+    return txt or None
 
 # ------------------------------------------------------------- eligibility
 MONTHS = {m: i + 1 for i, m in enumerate(
@@ -706,8 +861,11 @@ def hard_eligibility(j, prof):
     v = []
 
     # 1. degree requirements (BCA = bachelor's; can't satisfy master's/phd-only)
-    if re.search(r"(?:require|must have|requires)[^.]{0,60}\b(master'?s(?: degree)?|m\.?tech|ph\.?d|msc\b)[^.]{0,40}\b(degree|in\b)", body) \
+    if re.search(r"\bph\.?d\b", title) or re.search(r"\bmaster'?s?\b\s+(?:intern|student)", title):
+        v.append("❌ HARD ELIGIBILITY ISSUE: PhD/Master's-level posting — you are a BCA undergraduate")
+    elif re.search(r"(?:require|must have|requires)[^.]{0,60}\b(master'?s(?: degree)?|m\.?tech|ph\.?d|msc\b)[^.]{0,40}\b(degree|in\b)", body) \
        or re.search(r"\b(master'?s degree|ph\.?d|msc|m\.?tech)\s+(?:is )?(?:required|mandatory|must)\b", body) \
+       or re.search(r"\b(?:ph\.?d|master'?s)\s+(?:student|candidate)s?\s+(?:doing|pursuing|only|preferred|enrolled)", body) \
        or re.search(r"^(?:requirements?|minimum qualifications?)[\s\S]{0,200}?(?:master'|ph\.?d)", desc, re.M):
         if "bca" not in body and "bachelor" not in body and "any degree" not in body \
            and "or equivalent" not in body and "currently pursuing" not in body:
@@ -758,6 +916,8 @@ INDIA_RE = re.compile(r"(?<![a-z])(" + "|".join(INDIA_CITIES).replace(" ", r"\s"
 REMOTE_ONLY_SOURCES = ("remotive", "remoteok", "jobicy")
 LOC_UNKNOWN = ("", "not specified", "n/a", "na", "varies", "multiple locations",
                "see posting", "wellfound (varies)", "linkedin", "youtube announcement")
+# "2 Locations", "5 Locations" — Workday's placeholder for multi-site reqs
+LOC_MULTI_RE = re.compile(r"^\d+\s+locations?$|^multiple\b|^various\b")
 # "Remote - US" / "Canada Remote" / "Spain Remote" mean remote WITHIN that country:
 # he would need work authorization there, so they are not opportunities he can take.
 FOREIGN_REMOTE = ("usa", "u.s.", "united states", "us only", "remote - us", "us remote",
@@ -778,6 +938,8 @@ FOREIGN_REMOTE = ("usa", "u.s.", "united states", "us only", "remote - us", "us 
                   "tokyo", "sydney", "melbourne", "singapore", "tel aviv", "sao paulo")
 GLOBAL_REMOTE = ("worldwide", "anywhere", "global", "any location", "fully remote",
                  "work from anywhere", "remote (global)", "international")
+# short country tokens need word boundaries: "Remote, US" / "Remote - UK" / "EU remote"
+FOREIGN_TOKEN_RE = re.compile(r"(?<![a-z])(us|usa|u\.s\.?|uk|eu|uae|apac|emea|latam)(?![a-z])")
 
 def location_gate(j):
     """Remote is fine when he can actually take it from India: globally-remote or
@@ -804,10 +966,12 @@ def location_gate(j):
         if any(g in loc for g in GLOBAL_REMOTE) or any(g in head for g in GLOBAL_REMOTE):
             return True, "Remote worldwide"
         foreign = [c for c in FOREIGN_REMOTE if c in loc]
-        if foreign:
-            return False, f"remote locked to {foreign[0]} — work authorization needed"
+        tok = FOREIGN_TOKEN_RE.search(loc)
+        if foreign or tok:
+            where = foreign[0] if foreign else tok.group(1)
+            return False, f"remote locked to {where} — work authorization needed"
         return True, None  # plain "Remote" with no country named
-    if loc in LOC_UNKNOWN or len(loc) < 3:
+    if loc in LOC_UNKNOWN or len(loc) < 3 or LOC_MULTI_RE.match(loc):
         return True, "location unverified"
     if "hybrid" in loc:
         return False, "hybrid abroad"  # hybrid abroad means regular office presence
@@ -903,7 +1067,9 @@ def score_job(j, prof, cfg):
     # A JD too short to describe anything (aggregator placeholders like
     # "Python Development internship via Internshala") cannot prove a match:
     # naming one technology used to buy a perfect 35/35, beating real JDs.
-    thin_jd = len(desc) < 250
+    thin_jd = len(desc) < 250 and not re.search(
+        r"requirement|qualification|responsibilit|you will|what you|must have|preferred",
+        desc, re.I)
     have_hits = [s for s in have if word_hit(s, req_blob)]
     if thin_jd:
         breakdown["required"] = 20  # neutral: unproven either way
@@ -1040,6 +1206,13 @@ def score_job(j, prof, cfg):
     # early-hiring flag (no score inflation; it's a reporting priority)
     if re.search(r"\b202[7-9]\b", title + " " + body[:300]):
         reasons.append("🎯 early hiring — applications open now for a future joining date")
+    season = find_season(j)
+    if season:
+        reasons.append(f"🎯 {season} cohort — applications open ahead of the start date")
+    # unusually high pay is a priority signal, not a score bonus
+    pay_emoji, pay_note = pay_flag(j)
+    if pay_note:
+        reasons.insert(0, pay_note)
 
     # hours/week: college semester allows 15-20; heavier must be flagged not hidden
     hours = find_hours(body)
@@ -1066,6 +1239,10 @@ def score_job(j, prof, cfg):
     if re.search(r"\b(?:l[3-9]|level [3-9]|iii|iv|v)\b", title) or \
        re.search(r"\b(?:engineer|developer|scientist|analyst)\s*[3-9]\b", title):
         ceiling = min(ceiling, 55)  # numbered mid-level ladder rung
+    if re.search(r"\bph\.?d\b", title) or \
+       re.search(r"\b(?:ph\.?d|master'?s)\s+(?:student|candidate)s?\s+"
+                 r"(?:doing|pursuing|only|preferred|enrolled)", body):
+        ceiling = min(ceiling, 50)  # postgraduate-only posting
     score = max(0, min(ceiling, min(100, sum(breakdown.values()) + adj)))
 
     # full-time detection for downstream joining-date rule
@@ -1136,8 +1313,9 @@ def deliver(cfg, subject, body_text):
 def job_facts(j):
     """Extracted card fields for alerts (best-effort from posting text)."""
     body = f"{j['title']} {j['desc']} {j['location']}".lower()
+    # stipend keeps original casing so the card reads "Rs 25,000", not "rs 25,000"
     return {
-        "stipend": find_stipend(body),
+        "stipend": find_stipend(f"{j['title']} {j['desc']}"),
         "eligibility": find_eligibility(j),
         "deadline": find_deadline(j),
         "joining": find_joining(j),
@@ -1220,14 +1398,22 @@ def match_tier(sc):
 
 def alert_text(j, sc, reasons, missing, gem=False):
     f = job_facts(j)
+    pay_emoji, pay_note = pay_flag(j)
+    season = find_season(j)
     L = []
     add = L.append
-    add(f"🔥 {j['title']} — {j['company']}")
+    add(f"{pay_emoji or '🔥'} {j['title']} — {j['company']}")
     add("")
-    add(f"📍 {j['location']}")
-    add(f"💰 {f['stipend'] or 'Not disclosed'}")
+    add(f"📍 {j['location'] or 'Not specified'}")
+    pay_line = f['stipend'] or 'Not disclosed'
+    if pay_note:
+        # show the normalised monthly figure — raw feed strings drop the period
+        pay_line = pay_note.split("— ", 1)[-1]
+    add(f"💰 {pay_line}{'  ' + pay_emoji if pay_emoji else ''}")
     add(f"🎓 {f['eligibility'] or 'Not disclosed'}")
     add(f"📅 Posted: {j.get('date') or 'Not specified'}")
+    if season:
+        add(f"🗓 Cohort: {season}")
     join_line = f['joining'] or ("Joining date unclear — verify before applying"
                                  if j.get('_ft') else "Not specified")
     add(f"🚀 Joining: {join_line}")
@@ -1265,15 +1451,106 @@ def alert_text(j, sc, reasons, missing, gem=False):
     add(f"🔎 Source: {j.get('source', 'Not specified')}")
     return "\n".join(L)
 
+def find_season(j):
+    """Named internship cohort ('Summer 2027', 'Winter 2026', 'Fall 2027').
+    These open months ahead of the start date, so they are a priority signal."""
+    body = f"{j.get('title') or ''} {(j.get('desc') or '')[:2500]}"
+    m = re.search(r"\b(summer|winter|fall|autumn|spring|monsoon)\s*[-/ ]?\s*(20(?:2[6-9]))\b",
+                  body, re.I)
+    if m:
+        return f"{m.group(1).title()} {m.group(2)}"
+    m = re.search(r"\b(20(?:2[6-9]))\s+(summer|winter|fall|autumn|spring)\b", body, re.I)
+    if m:
+        return f"{m.group(2).title()} {m.group(1)}"
+    # "2027 Intern - Machine Learning Engineer" (Adobe/Nvidia style) — cohort year only
+    m = re.search(r"\b(20(?:2[6-9]))\s+(?:intern|new college grad|graduate)", body, re.I)
+    if m:
+        return f"{m.group(1)} cohort"
+    return None
+
+# monthly-INR equivalents; USD converted at a deliberately conservative 85/USD
+HIGH_PAY_MONTHLY_INR = 60000
+EXCEPTIONAL_PAY_MONTHLY_INR = 150000
+
+def pay_monthly_inr(text):
+    """Best-effort monthly INR value of a pay string. Returns None when unparseable —
+    never guesses, because a wrong number here would fire a false priority alert."""
+    if not text:
+        return None
+    t = text.lower().replace(",", "")
+    usd = bool(re.search(r"\$|usd", t))
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|to|–)\s*(\d+(?:\.\d+)?)", t)
+    num = None
+    if m:                                  # take the low end of a range
+        num = float(m.group(1))
+    else:
+        m = re.search(r"(\d+(?:\.\d+)?)", t)
+        if m:
+            num = float(m.group(1))
+    if num is None:
+        return None
+    if re.search(r"\bk\b|k\s*(?:/|per)", t) and num < 1000:
+        num *= 1000
+    if re.search(r"lpa|lakhs?|lac\b", t):
+        return num * 100000 / 12
+    per_year = bool(re.search(r"year|annum|annual|/yr|per yr|pa\b", t))
+    per_hour = bool(re.search(r"hour|/hr|hourly", t))
+    per_week = bool(re.search(r"week|/wk", t))
+    if usd:
+        num *= 85
+    if per_hour:
+        val = num * 160
+    elif per_week:
+        val = num * 4.3
+    elif per_year:
+        val = num / 12
+    else:
+        val = num                          # default: already monthly
+    # A monthly figure this large means the currency or period was misread
+    # (job feeds mislabel INR as USD). Refuse rather than fire a false alert.
+    return None if val > 5000000 else val
+
+def pay_flag(j):
+    """(emoji, note) when the stated pay is unusually high, else (None, None)."""
+    desc = j.get("desc") or ""
+    stipend = find_stipend(desc)
+    if not stipend or re.search(r"unpaid|not paid", stipend, re.I):
+        return None, None
+    ctx = stipend
+    if not re.search(r"month|year|annum|annual|hour|week|lpa|lakh|/yr|/hr|pa\b", stipend, re.I):
+        # the snippet may have been cut before its period unit ("USD 175000" from
+        # "USD 175000-380000 per year") — read a little further in the JD
+        at = desc.find(stipend[:20])
+        if at >= 0:
+            ctx = desc[at:at + len(stipend) + 60]
+    val = pay_monthly_inr(ctx)
+    if not val:
+        return None, None
+    if val >= EXCEPTIONAL_PAY_MONTHLY_INR:
+        return "💎💎", (f"💎💎 EXCEPTIONAL PAY — {stipend} "
+                       f"(~₹{int(val):,}/month equivalent)")
+    if val >= HIGH_PAY_MONTHLY_INR:
+        return "💎", f"💎 HIGH PAY — {stipend} (~₹{int(val):,}/month equivalent)"
+    return None, None
+
 def split_full_rest(to_send, cfg):
-    """Top N jobs get the full card; everything else goes in the compact digest."""
+    """Top N jobs get the full card; everything else goes in the compact digest.
+    High-pay finds are promoted into the full-card tier regardless of rank — the
+    user asked to be told about those immediately."""
     n = int(cfg.get("full_cards_per_run", 3))
-    return to_send[:n], to_send[n:]
+    priority = [x for x in to_send if any("💎" in r for r in x[2])]
+    rest = [x for x in to_send if x not in priority]
+    top = priority + rest[:max(0, n - len(priority))]
+    return top, [x for x in to_send if x not in top]
 
 def compact_line(sc, j, r, m):
     """2-line compact entry for the digest message."""
-    badge = ("🔥" if sc >= 85 else "🟢" if sc >= 70 else "🟡")
+    pay_emoji, _ = pay_flag(j)
+    badge = pay_emoji or ("🔥" if sc >= 85 else "🟢" if sc >= 70 else "🟡")
     tags = []
+    season = find_season(j)
+    if season:
+        tags.append("🗓 " + season)
     for reason in r:
         if "🎯" in reason and len(tags) < 2:
             tags.append("🎯 early-hiring")
@@ -1370,6 +1647,17 @@ def main():
     prof["_ashby_companies"] = ["elevenlabs", "Perplexity", "Cohere", "Runway",
                                 "baseten", "openai", "notion", "ramp", "modal",
                                 "sarvam", "composio", "spotdraft"]
+    # Workday-hosted big-tech career sites (label, host, tenant, site) — all verified live
+    prof["_workday_tenants"] = [
+        ("nvidia", "nvidia.wd5", "nvidia", "NVIDIAExternalCareerSite"),
+        ("adobe", "adobe.wd5", "adobe", "external_experienced"),
+        ("salesforce", "salesforce.wd12", "salesforce", "External_Career_Site"),
+        ("micron", "micron.wd1", "micron", "External"),
+        ("hpe", "hpe.wd5", "hpe", "Jobsathpe"),
+        ("autodesk", "autodesk.wd1", "autodesk", "uni"),
+        ("paypal", "paypal.wd1", "paypal", "jobs"),
+        ("ebay", "ebay.wd5", "ebay", "apply"),
+    ]
     SLUGS = {}
     for c in prof["_sr_companies"] + prof["_gh_companies"] + prof["_lever_companies"] + prof["_ashby_companies"]:
         SLUGS[c.lower()] = c.replace("-", " ").title()
@@ -1380,7 +1668,9 @@ def main():
                   "ramp": "Ramp", "gitlab": "GitLab", "netradyne": "Netradyne",
                   "postman": "Postman", "sarvam": "Sarvam AI", "composio": "Composio",
                   "spotdraft": "SpotDraft", "zeta": "Zeta", "paytm": "Paytm",
-                  "mindtickle": "Mindtickle"})
+                  "mindtickle": "Mindtickle", "nvidia": "NVIDIA", "adobe": "Adobe",
+                  "salesforce": "Salesforce", "micron": "Micron", "hpe": "HPE",
+                  "autodesk": "Autodesk", "paypal": "PayPal", "ebay": "eBay"})
     globals()["_COMPANY_SLUGS"] = SLUGS
 
     seen = load_json(SEEN_FILE, {})
@@ -1417,9 +1707,14 @@ def main():
                         ("intern", "internship", "remote", "part", "time", "full"))
         comp = re.sub(r"[^a-z0-9 ]", "", j["company"].lower())
         return (comp, role[:60])
-    ATS_PRIORITY = ("ashby", "greenhouse", "lever", "smartrecruiters", "netflix",
-                    "amazon", "remotive", "remoteok", "jobicy", "arbeitnow",
-                    "internshala", "wellfound", "linkedin", "indeed", "youtube")
+    ATS_PRIORITY = ("ashby", "greenhouse", "lever", "workday", "smartrecruiters",
+                    "netflix", "amazon", "google", "oracle", "yc", "remotive",
+                    "remoteok", "jobicy", "arbeitnow", "internshala", "wellfound",
+                    "linkedin", "indeed", "youtube")
+
+    def ats_rank(src):
+        # unknown sources sort last instead of crashing the run
+        return ATS_PRIORITY.index(src) if src in ATS_PRIORITY else len(ATS_PRIORITY)
     by_key = {}
     for j in all_jobs:
         if not j.get("title") or not j.get("url") or j["id"] in seen_ids:
@@ -1431,7 +1726,7 @@ def main():
         k = dedup_key(j)
         if k in by_key:
             kept = by_key[k]
-            if ATS_PRIORITY.index(j["source"]) < ATS_PRIORITY.index(kept["source"]):
+            if ats_rank(j["source"]) < ats_rank(kept["source"]):
                 by_key[k] = j
             continue
         by_key[k] = j
@@ -1514,7 +1809,9 @@ def main():
         top, rest = split_full_rest(to_send, cfg)
         # 1) a few full cards, one message each
         for sc, j, r, m in top:
-            subj = f"🔥 [{sc}%] {j['title']} at {j['company']}"
+            pe, _ = pay_flag(j)
+            head = f"{pe} HIGH PAY" if pe else "🔥"
+            subj = f"{head} [{sc}%] {j['title']} at {j['company']}"
             if deliver(cfg, subj, alert_text(j, sc, r, m)):
                 sent += 1
                 seen[j["id"]] = now_iso
