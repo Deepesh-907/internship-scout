@@ -3,3 +3,13 @@ email.json
 probe_*.py
 __pycache__/
 *.pyc
+
+# the resume — public repo, so it lives in the PROFILE_JSON secret instead
+profile.json
+
+# scratch from debugging sessions
+_dbg_*.py
+_live*.txt
+*.bak
+.wf-hydration/
+_secret_*.txt

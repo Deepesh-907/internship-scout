@@ -69,6 +69,57 @@ def clean(s):
     s = re.sub(r"<[^>]+>", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
+# Block-level tags are the only sentence boundaries a bulleted JD has. clean()
+# turns every tag into one space, so "...a related field</li><li>Self-directed:
+# reads source..." arrives downstream as a single unpunctuated run -- and every
+# card fact in job_facts() bounds itself on `.`, `;`, `|` or a newline. With none
+# of those left, find_eligibility's 100-char tail ran into the next bullet and was
+# cut mid-word, and extract_responsibilities had nothing to split on and fell back
+# to "As described in the posting". Closing each block with a period fixes all of
+# them at the source instead of teaching each regex about de-bulleted text.
+JD_BLOCK_RE = re.compile(r"</(?:li|p|div|h[1-6]|tr|td|th|section|article|ul|ol|dl|dd|dt|"
+                         r"blockquote|figcaption)\s*>|<br\s*/?>", re.I)
+
+# Not every block boundary is a sentence boundary. LinkedIn closes the list
+# mid-phrase and leaves the remainder outside it -- "(PyTorch /<br></li></ul>
+# TensorFlow)" and "when not</li></ul>to use ML" -- so a period there invents a
+# broken sentence ("PyTorch /.") and truncates the bullet at it. The guard reads
+# the text on the LEFT: a fragment ending in a joiner or a dangling connective
+# cannot end a sentence. Lower case on the RIGHT is deliberately not a guard --
+# Internshala writes every real bullet that way ("have relevant skills").
+JD_MARK = "\x00"
+JD_JOIN_END_RE = re.compile(
+    r"(?:[/&+,:;(\[\-\u2013\u2014]"
+    r"|\b(?:a|an|and|are|as|at|be|been|but|by|for|from|have|in|into|is|nor|not|of"
+    r"|on|or|per|than|that|the|to|under|upon|via|when|which|while|who|whom|whose"
+    r"|with|within|without|over|between|during|plus|both|either|neither))\s*$",
+    re.I)
+
+
+def clean_jd(s):
+    """clean() for a job-description body: block-level tags end a sentence.
+
+    Inline tags (<strong>, <em>, <a>) still collapse to a space -- they sit inside
+    a phrase, and closing one would chop the phrase in half. On text that carries
+    no markup at all this is exactly clean(). See JD_JOIN_END_RE for the boundaries
+    that look like sentence ends but are not."""
+    import html as _html
+    s = _html.unescape(s or "")
+    s = JD_BLOCK_RE.sub(JD_MARK, s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    out = ""
+    for nxt in s.split(JD_MARK):
+        left, right = out.rstrip(), nxt.strip()
+        if not left or not right:
+            out = left or right
+            continue
+        if left[-1] in ".!?\u2026" or JD_JOIN_END_RE.search(left):
+            out = left + " " + right
+        else:
+            out = left + ". " + right
+    return out.strip().lstrip(". ").strip()
+
 def unescape_html(s):
     """Greenhouse returns double-escaped HTML (&lt;p&gt;...); unescape then strip."""
     import html as _html
@@ -139,7 +190,7 @@ def indeed_jsonld(page):
                 "company": clean(org.get("name") or "?"),
                 "location": loc or "See posting",
                 "url": it.get("url") or it.get("sameAs") or "https://www.indeed.com",
-                "desc": clean(re.sub(r"<[^>]+>", " ", it.get("description") or ""))[:4000],
+                "desc": clean_jd(it.get("description") or "")[:4000],
                 "date": (it.get("datePosted") or "")[:10],
             })
     return out
@@ -148,13 +199,182 @@ def indeed_jsonld(page):
 def J(src, jid, title, company, loc, url, desc, date=""):
     return {"id": f"{src}:{jid}", "title": clean(str(title)), "company": clean(str(company)),
             "location": clean(str(loc)) or "Not specified", "url": url,
-            "desc": clean(str(desc))[:8000], "date": (date or "")[:10], "source": src}
+            "desc": clean_jd(str(desc))[:8000], "date": (date or "")[:10], "source": src}
 
 # slug -> display name for ATS board companies; populated in main() before feeds run
 _COMPANY_SLUGS = {}
 
 def company_map(slug):
     return _COMPANY_SLUGS.get(slug.lower(), slug.replace("-", " ").title())
+
+# ---------------------------------------------------------- detail hydration
+# Stand-in company/location text emitted by the scraped sources ("Wellfound
+# startup", "India (Internshala)"). A JobPosting payload is authoritative for
+# those two fields; a real value is never clobbered.
+PLACEHOLDER_RE = re.compile(r"^(?:\?+|-+|n/?a|none|null|unknown|undisclosed|varies"
+                            r"|not\s(?:specified|disclosed|available)|see\sposting"
+                            r"|multiple\slocations|\w+\s(?:employer|startup|company)"
+                            r"|\w+\s\((?:varies|internshala|announcement)\))$", re.I)
+LN_DESC_RE = re.compile(r'show-more-less-html__markup[^>]*>(.*?)</div>', re.S)
+LN_POSTED_RE = re.compile(r'posted-time-ago__text[^>]*>(.*?)</span>', re.S)
+LN_CRIT_RE = re.compile(r'description__job-criteria-subheader[^>]*>(.*?)</h3>\s*'
+                        r'<span[^>]*description__job-criteria-text[^>]*>(.*?)</span>', re.S)
+
+def hydrate_jobs(jobs, fetch, cap, label, pause=0.3):
+    """Fetch one detail page per survivor. A single failure never aborts the source —
+    the remaining jobs are still fetched. Returns the number of jobs attempted."""
+    batch = jobs[:cap]
+    bad = 0
+    for i, job in enumerate(batch):
+        if pause and i:
+            time.sleep(pause)
+        try:
+            fetch(job)
+        except Exception:
+            bad += 1
+    log(f"{label}: hydrated {len(batch)} descriptions" + (f" ({bad} failed)" if bad else ""))
+    return len(batch)
+
+def jsonld_jobposting(page):
+    """First schema.org JobPosting in any ld+json block on the page, else None."""
+    for m in JSON_LD_RE.finditer(page or ""):
+        try:
+            data = json.loads(m.group(1).strip())
+        except ValueError:
+            continue                    # JS-templated / truncated blocks are common
+        for it in (data if isinstance(data, list) else [data]):
+            if not isinstance(it, dict):
+                continue
+            for node in [it] + [g for g in (it.get("@graph") or []) if isinstance(g, dict)]:
+                t = node.get("@type")
+                if any(str(x).lower() == "jobposting"
+                       for x in (t if isinstance(t, list) else [t])):
+                    return node
+    return None
+
+def apply_jobposting(job, ld):
+    """Fill a row in place from a schema.org JobPosting. An empty or absent field
+    leaves the existing value untouched, so apply_jobposting(job, {}) is a no-op.
+    baseSalary and validThrough are appended as English sentences because the card
+    facts are regexed back out of desc by job_facts()."""
+    if not isinstance(ld, dict):
+        return
+    body = ld.get("description")
+    if body:
+        job["desc"] = clean_jd(unescape_html(str(body)))[:8000]
+    posted = str(ld.get("datePosted") or "")[:10]
+    if re.match(r"\d{4}-\d{2}-\d{2}", posted):
+        job["date"] = posted
+    org = ld.get("hiringOrganization")
+    name = clean(str(org.get("name") or "")) if isinstance(org, dict) else ""
+    have = str(job.get("company") or "").strip()
+    if name and (not have or PLACEHOLDER_RE.match(have)):
+        job["company"] = name
+    parts = []
+    loc = ld.get("jobLocation")
+    for entry in (loc if isinstance(loc, list) else [loc]):
+        ad = entry.get("address") if isinstance(entry, dict) else None
+        for key in ("addressLocality", "addressRegion", "addressCountry"):
+            if isinstance(ad, dict) and ad.get(key):
+                parts.append(clean(str(ad[key])))
+    where = ", ".join(dict.fromkeys(p for p in parts if p))[:120]
+    have = str(job.get("location") or "").strip()
+    if where and (not have or PLACEHOLDER_RE.match(have)):
+        job["location"] = where
+    # ---- structured -> prose bridge: find_stipend/find_deadline read desc only
+    extra = ""
+    sal = ld.get("baseSalary")
+    if isinstance(sal, dict):
+        val = sal.get("value")
+        val = val if isinstance(val, dict) else {"minValue": val}
+        nums = []
+        for v in (val.get("minValue"), val.get("maxValue")):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f <= 0:
+                continue
+            nums.append(str(int(f)) if f == int(f) else str(f))
+        if nums:
+            cur = clean(str(sal.get("currency") or "")) or "USD"
+            unit = clean(str(val.get("unitText") or "YEAR")).lower() or "year"
+            amt = "-".join(dict.fromkeys(nums))
+            extra += f" Compensation: {cur} {amt} per {unit}."
+    until = str(ld.get("validThrough") or "")[:10]
+    if re.match(r"\d{4}-\d{2}-\d{2}", until):
+        import datetime as dt
+        try:
+            when = dt.date(int(until[:4]), int(until[5:7]), int(until[8:10]))
+            extra += " Apply by " + when.strftime("%b %d, %Y") + "."
+        except ValueError:
+            pass
+    if extra:
+        job["desc"] = (str(job.get("desc") or "")[:8000 - len(extra)] + extra).strip()
+
+def parse_linkedin_detail(page):
+    """LinkedIn guest job page: description body, relative posted date and the
+    criteria list. Never raises; missing markup yields empty strings."""
+    if isinstance(page, (bytes, bytearray)):
+        page = page.decode("utf-8", "replace")
+    page = page if isinstance(page, str) else ""
+    out = {"desc": "", "date": "", "employment_type": "", "criteria": ""}
+    m = LN_DESC_RE.search(page)
+    if m:
+        out["desc"] = clean_jd(m.group(1))[:8000]
+    m = LN_POSTED_RE.search(page)
+    if m:
+        out["date"] = relative_date_to_iso(clean(m.group(1)))
+    # the page ships the criteria list twice (mobile + desktop markup), padded with
+    # newlines — de-duplicate on the (heading, value) pair, preserving order
+    pairs = []
+    for head, text in LN_CRIT_RE.findall(page):
+        pair = (clean(head), clean(text))
+        if pair[1] and pair not in pairs:
+            pairs.append(pair)
+    out["criteria"] = " · ".join(v for _h, v in pairs)
+    for head, text in pairs:
+        if head.lower().startswith("employment type"):
+            out["employment_type"] = text
+            break
+    return out
+
+def relative_date_to_iso(text, today=None):
+    """LinkedIn posts relative ages: '5 hours ago', '2 days ago', '30+ days ago',
+    '3 weeks ago', '1 month ago' -> ISO date. Weeks are 7 days, months 30.
+    An already-ISO date passes through unchanged, so a caller that converts a
+    parse_linkedin_detail date a second time still gets a date. Unparseable or
+    empty input returns ''."""
+    import datetime as dt
+    text = str(text or "")
+    done = re.match(r"\s*(\d{4}-\d{2}-\d{2})", text)
+    if done:
+        return done.group(1)
+    m = re.search(r"(\d{1,4})\s*\+?\s*(minute|min|hour|hr|day|week|month|year)s?",
+                  text, re.I)
+    if not m:
+        return ""
+    span = {"minute": 0, "min": 0, "hour": 0, "hr": 0, "day": 1,
+            "week": 7, "month": 30, "year": 365}[m.group(2).lower()]
+    try:
+        base = today or dt.date.today()
+        return (base - dt.timedelta(days=span * int(m.group(1)))).isoformat()[:10]
+    except (OverflowError, TypeError, ValueError):
+        return ""
+
+def netflix_desc(payload):
+    """Description text out of a Netflix detail payload: job_description, falling
+    back to custom_JD when that field carries prose instead of the metadata dict."""
+    d = payload if isinstance(payload, dict) else {}
+    if not (d.get("job_description") or d.get("custom_JD")):
+        pos = d.get("positions")            # the v2 API wraps details in positions[]
+        if isinstance(pos, list) and pos and isinstance(pos[0], dict):
+            d = pos[0]
+    body = d.get("job_description") or ""
+    if not body:
+        alt = d.get("custom_JD")
+        body = alt if isinstance(alt, str) else ""
+    return clean(unescape_html(str(body)))[:8000] if body else ""
 
 def adp_remotive(p):
     kw = urllib.parse.quote(p["_keyword"])
@@ -195,16 +415,43 @@ def adp_arbeitnow(p):
             for j in d.get("data", []) if j.get("title")]
 
 def adp_netflix(p):
+    """Two-phase: the list payload has no 'description' key at all and its
+    job_description is present-but-empty, so gate on the cheap list fields and
+    hydrate survivors from the per-position detail endpoint, which serves the
+    real JD (~8.5 kB of HTML)."""
     d = get_json("https://explore.jobs.netflix.net/api/apply/v2/jobs?domain=netflix.com"
                  "&query=intern&num=30&sort_by=new")
-    out = []
+    out, hydrate = [], []
     for j in d.get("positions", []):
         locs = ",".join(str(x.get("value", "")) for x in (j.get("metadata") or [])
                         if isinstance(x, dict))
-        out.append(J("netflix", j.get("canonicalPositionUuid") or j.get("id"),
-                     j.get("name"), "Netflix", (str(j.get("location") or "") + " " + locs)[:140],
-                     f"https://explore.jobs.netflix.net/careers/job?domain=netflix.com&pid={j.get('id','')}",
-                     str(j.get("description", "")), (j.get("createdDate") or "")))
+        job = J("netflix", j.get("canonicalPositionUuid") or j.get("id"),
+                j.get("name"), "Netflix", (str(j.get("location") or "") + " " + locs)[:140],
+                f"https://explore.jobs.netflix.net/careers/job?domain=netflix.com&pid={j.get('id','')}",
+                "", "")
+        out.append(job)
+        if not is_target_title(job["title"]):
+            continue
+        ok, _ = location_gate(job)
+        if ok:
+            hydrate.append(job)
+
+    def fetch(job):
+        pid = job["url"].rsplit("pid=", 1)[-1]
+        one = get_json("https://explore.jobs.netflix.net/api/apply/v2/jobs/"
+                       f"{pid}?domain=netflix.com")
+        body = netflix_desc(one)
+        if body:
+            job["desc"] = body
+        # t_create is epoch seconds — the payload carries no createdDate at all
+        try:
+            posted = time.strftime("%Y-%m-%d", time.gmtime(int(one.get("t_create"))))
+        except (TypeError, ValueError, OSError, OverflowError):
+            posted = ""
+        if re.match(r"\d{4}-\d{2}-\d{2}", posted[:10]):
+            job["date"] = posted[:10]
+
+    hydrate_jobs(hydrate, fetch, 8, "netflix")
     return out
 
 def adp_amazon(p):
@@ -286,7 +533,7 @@ def adp_greenhouse(p):
     for company, jid, job in hydrate[:70]:
         try:
             one = get_json(f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs/{jid}")
-            job["desc"] = clean(unescape_html(str(one.get("content") or "")))[:8000]
+            job["desc"] = clean_jd(unescape_html(str(one.get("content") or "")))[:8000]
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
             continue
     log(f"greenhouse: hydrated {min(len(hydrate), 70)} descriptions")
@@ -308,7 +555,7 @@ def adp_lever(p):
                          ((j.get("categories") or {}).get("location") or "") + " " +
                          str(j.get("workplaceType") or ""),
                          j.get("hostedUrl") or j.get("applyUrl") or "",
-                         clean(f"{j.get('description','')} "
+                         clean_jd(f"{j.get('description','')} "
                                f"{json.dumps(j.get('lists') or [])}"),
                          time.strftime("%Y-%m-%d", time.gmtime(created / 1000)) if created else ""))
     return out
@@ -337,6 +584,9 @@ def adp_ashby(p):
     return out
 
 def adp_wellfound(p):
+    """Two-phase: the list page carries only ids and slugs, so gate on the
+    slug-derived title, then hydrate survivors from each detail page's schema.org
+    JobPosting — company, location, pay and JD only exist there."""
     page = http("https://wellfound.com/jobs", headers={"Accept": "text/html"}).decode("utf-8", "replace")
     titles = [strip_bs(t) for t in WF_TITLE_RE.findall(page)]
     out, used = [], set()
@@ -358,8 +608,39 @@ def adp_wellfound(p):
             best = (parts[0].replace("-", " ") + " at " +
                     (parts[1].replace("-", " ") if len(parts) > 1 else "startup")).title()
         used.add(jid)
+        if not is_target_title(best):
+            continue
+        # placeholders only: hydration replaces them, and an unhydrated row is dropped
+        # by quality_check ("company not identifiable") instead of alerting on invented data
         out.append(J("wellfound", jid, best, "Wellfound startup", "Wellfound (varies)",
                      "https://wellfound.com" + m.group(1), "", ""))
+
+    def fetch(job):
+        detail = http(job["url"], headers={"Accept": "text/html"}).decode("utf-8", "replace")
+        ld = jsonld_jobposting(detail)
+        if not ld:
+            return
+        apply_jobposting(job, ld)
+        # A TELECOMMUTE row still carries the startup's HQ address, which the gate reads
+        # as onsite-abroad; applicantLocationRequirements is the only truthful statement
+        # of who may take the job. Never name India in the locked branch — INDIA_RE would
+        # match it and launder a country-locked role straight through the gate.
+        if not str(ld.get("jobLocationType") or "").lower().startswith("tele"):
+            return
+        reqs = ld.get("applicantLocationRequirements") or []
+        allowed = [clean(str((c.get("name") if isinstance(c, dict) else c) or "")) for c in
+                   (reqs if isinstance(reqs, list) else [reqs]) if isinstance(c, (dict, str))]
+        allowed = [c for c in allowed if c]
+        if not allowed:
+            tag = "Remote"
+        elif any(INDIA_RE.search(c.lower()) for c in allowed):
+            tag = "Remote (India eligible)"
+        else:
+            tag = f"Remote (region-locked: {', '.join(allowed[:2])})"
+        loc = "" if job["location"].strip().lower() in LOC_UNKNOWN else job["location"][:70]
+        job["location"] = clean(f"{loc} {tag}")[:120]
+
+    hydrate_jobs(out, fetch, 25, "wellfound")
     return out
 
 def adp_indeed(p):
@@ -381,7 +662,9 @@ def adp_indeed(p):
     return out
 
 def adp_linkedin(p):
-    """LinkedIn guest jobs HTML — job cards carry data-entity-urn ids."""
+    """LinkedIn guest jobs HTML — job cards carry data-entity-urn ids but no
+    description, so gate-passing cards are hydrated from the guest jobPosting
+    endpoint; its only posted date is relative ('5 hours ago')."""
     kw = urllib.parse.quote("internship software AI machine learning")
     loc = urllib.parse.quote(p.get("_indeed_location", "India"))
     page = http("https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
@@ -392,20 +675,42 @@ def adp_linkedin(p):
               re.findall(r'base-search-card__title[^>]*>\s*([^<]{3,120})', page)]
     companies = [clean(c) for c in
                  re.findall(r'base-search-card__subtitle[^>]*>\s*(?:<a[^>]*>)?\s*([^<]{2,80})', page)]
-    out, seen = [], set()
+    out, seen, hydrate = [], set(), []
     locations = [clean(x) for x in
                  re.findall(r'job-search-card__location[^>]*>\s*([^<]{2,80})', page)]
     for i, jid in enumerate(ids):
         if jid in seen:
             continue
         seen.add(jid)
-        out.append(J("linkedin", jid,
-                     titles[i] if i < len(titles) else "Internship",
-                     companies[i] if i < len(companies) else "LinkedIn employer",
-                     # the search is already location-scoped to India; never emit
-                     # "LinkedIn" as a location — the gate reads it as onsite-abroad
-                     locations[i] if i < len(locations) else p.get("_indeed_location", "India"),
-                     f"https://www.linkedin.com/jobs/view/{jid}", ""))
+        job = J("linkedin", jid,
+                titles[i] if i < len(titles) else "Internship",
+                companies[i] if i < len(companies) else "LinkedIn employer",
+                # the search is already location-scoped to India; never emit
+                # "LinkedIn" as a location — the gate reads it as onsite-abroad
+                locations[i] if i < len(locations) else p.get("_indeed_location", "India"),
+                f"https://www.linkedin.com/jobs/view/{jid}", "")
+        out.append(job)
+        if not is_target_title(job["title"]):
+            continue
+        ok, _ = location_gate(job)
+        if ok:
+            hydrate.append(job)
+
+    def fetch(job):
+        one = http("https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/"
+                   + job["id"].split(":", 1)[1],
+                   headers={"Accept": "text/html"}).decode("utf-8", "replace")
+        d = parse_linkedin_detail(one)
+        if d.get("desc"):
+            # the criteria block (seniority, employment type) is a real signal the
+            # scorer reads out of desc — same use as ashby's employmentType
+            job["desc"] = clean(f"{d['desc']} "
+                                f"{d.get('criteria') or d.get('employment_type') or ''}")[:8000]
+        posted = relative_date_to_iso(d.get("date"))
+        if posted:
+            job["date"] = posted[:10]
+
+    hydrate_jobs(hydrate, fetch, 12, "linkedin")
     return out
 
 def adp_google(p):
@@ -467,7 +772,7 @@ def adp_workday(p):
         try:
             one = get_json(base + path)
             info = one.get("jobPostingInfo") or {}
-            job["desc"] = clean(str(info.get("jobDescription") or ""))[:8000]
+            job["desc"] = clean_jd(str(info.get("jobDescription") or ""))[:8000]
             job["location"] = (info.get("location") or job["location"])
             posted = str(info.get("startDate") or "")[:10]
             if re.match(r"\d{4}-\d{2}-\d{2}", posted):
@@ -515,7 +820,7 @@ def adp_yc(p):
         except ValueError:
             continue
         job["title"] = ld.get("title") or job["title"]
-        job["desc"] = clean(str(ld.get("description") or ""))[:8000]
+        job["desc"] = clean_jd(str(ld.get("description") or ""))[:8000]
         loc = ld.get("jobLocation")
         parts = []
         for entry in (loc if isinstance(loc, list) else [loc]):
@@ -572,8 +877,12 @@ def adp_oracle(p):
 
 def adp_internshala(p):
     """Internshala — demoted to a single highest-signal page (ML); low-signal
-    keyword scrapes removed. Its score floor is raised separately in main()."""
+    keyword scrapes removed. Its score floor is raised separately in main().
+    Two-phase like greenhouse: the listing page carries titles only, so
+    title-gate survivors are hydrated from their own detail page, which serves
+    one schema.org JobPosting (stipend, deadline, city, real JD)."""
     out = []
+    hydrate = []
     seen = set()
     for kw in ("machine%20learning",):
         try:
@@ -596,10 +905,47 @@ def adp_internshala(p):
             # "Applied Scientist", "Nlp Scientist", ...)
             if "intern" not in role.lower():
                 role = role + " Internship"
-            out.append(J("internshala", slug[:80], role, comp, "India (Internshala)",
-                        "https://internshala.com/internship/detail/" + slug,
-                        f"{role} internship via Internshala"))
+            # desc stays empty until hydration: the old synthetic one-liner
+            # ("<role> internship via Internshala") carried no fact the card could
+            # print and still read as a real JD to score_job
+            job = J("internshala", slug[:80], role, comp, "India (Internshala)",
+                    "https://internshala.com/internship/detail/" + slug, "")
+            out.append(job)
+            if is_target_title(role):
+                hydrate.append(job)
         time.sleep(1.0)
+
+    def fetch(job):
+        page = http(job["url"], headers={"Accept": "text/html"}).decode("utf-8", "replace")
+        ld = jsonld_jobposting(page)
+        if not ld:
+            return
+        # blank the hardcoded location so apply_jobposting installs the posting's own
+        # city; restored below when the payload names no place
+        job["location"] = ""
+        apply_jobposting(job, ld)
+        # responsibilities/skills are separate fields; append only the items the
+        # description does not already state, so job_facts sees them once
+        for key, lead in (("responsibilities", "Responsibilities"),
+                          ("skills", "Skills required")):
+            v = ld.get(key) or ""
+            v = ", ".join(str(x) for x in v) if isinstance(v, list) else str(v)
+            # word_hit, not a substring test: "Java" is a real missing skill when the
+            # JD only ever says "JavaScript"
+            new = [s for s in re.split(r"\s*,\s*", clean(v))
+                   if s and not word_hit(s, job["desc"].lower())]
+            if new:
+                job["desc"] = clean(f"{job['desc']} {lead}: "
+                                    f"{', '.join(new).rstrip('.')}.")[:8000]
+        # the address ends in the ISO code ("Allahabad, Uttar Pradesh, IN"), which is
+        # not an INDIA_RE token, and small towns are not in INDIA_CITIES — name the
+        # country so location_gate passes on merit instead of on a hardcoded string
+        loc = re.sub(r",?\s*\bIN\b\s*$", "", job["location"], flags=re.I).strip(" ,")
+        if loc and not INDIA_RE.search(loc.lower()):
+            loc += ", India"
+        job["location"] = clean(loc)[:120] or "India (Internshala)"
+
+    hydrate_jobs(hydrate, fetch, 30, "internshala")
     return out
 
 def adp_youtube(p):
@@ -640,6 +986,10 @@ def adp_youtube(p):
                 continue
             if not any(k in tl for k in ("2027", "2026", "apply", "openings", "announced",
                                          "program", "drive")):
+                continue
+            # a video naming a batch he is not in is stale by definition — "2024 Batch
+            # Hiring", "Off Campus Drive 2023". He graduates in 2027.
+            if re.search(r"\b20(?:1\d|2[0-5])\b", tl) and not re.search(r"\b202[6-9]\b", tl):
                 continue
             seen.add(vid)
             out.append(J("youtube", vid,
@@ -753,11 +1103,16 @@ def find_duration(body):
     return None
 
 def find_stipend(body):
-    """Pull a short salary/stipend snippet if present (skip perk stipends like lunch)."""
+    """Pull a short salary/stipend snippet if present (skip perk stipends like lunch).
+
+    RANGE is the optional "- 10,000" half of "INR 6,000 - 10,000 /month". Without
+    it the amount patterns stopped at the lower bound, which also stranded the
+    trailing "/month" -- the card then showed an amount with no period at all."""
+    RANGE = (r"(?:\s?(?:-|--|to)\s?(?:₹|\$|rs\.?|inr|usd)?\s?[\d,.]+\s?(?:k|lakh|lpa)?)?")
     pats = [r"(?:stipend|salary|compensation|pay(?:ing)?|interns? (?:are |get )?(?:paid|earn))"
-            r"[^.;\n]{0,60}(?:₹|\$|rs\.?|inr|usd)\s?[\d,.]+[kkl]?\s?"
+            r"[^.;\n]{0,60}(?:₹|\$|rs\.?|inr|usd)\s?[\d,.]+[kkl]?" + RANGE + r"\s?"
             r"(?:/?\s?(?:per\s)?(?:month|mo|yr|year|annum|lpa|pa|hour|hr|week))?",
-            r"(?:₹|\$|rs\.?|inr|usd)\s?[\d,.]+\s?(?:k|lakh|lpa)?\s?"
+            r"(?:₹|\$|rs\.?|inr|usd)\s?[\d,.]+\s?(?:k|lakh|lpa)?" + RANGE + r"\s?"
             r"(?:/?\s?(?:per\s)?(?:month(?:ly)?|mo|yr|year|annum|pa|hour|hr|week)|annually)",
             r"[\d,.]+\s?(?:lpa|lakhs?)(?!\s)",
             r"\bunpaid\b|not paid"]
@@ -775,7 +1130,10 @@ def find_stipend(body):
             # promotions, transfers" from EEO paragraphs), not a stipend
             if not re.search(r"\d", txt) and not re.search(r"unpaid|not paid", txt, re.I):
                 continue
-            return txt or None
+            # Internshala's markup yields "INR₹ 14,500" — the ISO code and the symbol
+            # both survive. Keep one.
+            txt = re.sub(r"\b(?:INR|Rs\.?)\s*(?=₹)", "", txt, flags=re.I)
+            return txt.strip() or None
     return None
 
 def find_deadline(j):
@@ -801,6 +1159,35 @@ def find_joining(j):
                   r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+20(?:2[6-9]|[3-9]\d))", body)
     if m:
         return clean(m.group(1))
+    # Day-first windows with an apostrophe year ("can start the internship
+    # between 7th Aug'26 and 11th Sep'26") are how Indian JDs state a start
+    # date, and neither pattern above can see one: the first needs a literal
+    # 20xx, the second a <Mon DD, YYYY>. Tried last, so a JD that does spell
+    # out a cohort year still wins.
+    day = (r"\d{1,2}(?:st|nd|rd|th)?\s+"
+           r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+           r"\.?\s*'?\s*(?:20)?(?:2[6-9]|[3-9]\d)")
+    # Searched over the whole JD, not body[:800]: this phrasing names a start
+    # window outright, so its position is not evidence that it is noise. The
+    # patterns above keep the narrow window -- a bare season+year that late in
+    # a JD usually is noise. Matched case-insensitively against the original
+    # desc rather than the lowered copy, so the card quotes "7th Aug'26" the
+    # way the JD wrote it.
+    # The engagement's own name sits between "start" and the preposition, and it is not
+    # one word: live rows say "start the work from home job/internship between 3rd
+    # Sep'26 and 8th Oct'26", others "the full time (in-office) internship". Allow any
+    # short run of words there, but no digits and no "." -- so a match cannot reach
+    # across a sentence into an unrelated date. The date shape itself is the real anchor.
+    # The filler also refuses clause connectives and finite verbs: without that,
+    # "the programme starts and applications are open from 1st Jan'27" reports the
+    # application-open date as the joining date. A comma or ";" is a clause break too.
+    filler = (r"(?:(?!\b(?:and|or|but|is|are|was|were|applications?|apply|deadline)\b)"
+              r"[a-z/&()'\-\s]){0,44}?")
+    m = re.search(r"start(?:s|ing)?\b" + filler + r"\b(?:between|from|on)\s+"
+                  r"(" + day + r"(?:\s*(?:and|to|until|till|[\u2013\u2014-])\s*" + day + r")?)",
+                  j.get("desc") or "", re.I)
+    if m:
+        return clean(m.group(1))
     return None
 
 def find_eligibility(j):
@@ -812,8 +1199,25 @@ def find_eligibility(j):
                   r"|master'?s?(?: degree)?|ph\.?d)"
                   r"[^.|;\n]{0,100}", body, re.I)
     if not m:
+        # Indian JDs name the discipline before the noun ("are Computer Science
+        # Engineering students"), which every branch above misses -- they are all
+        # noun-first or degree-abbreviations. Tried second, so a JD that does state
+        # a degree still gets the more specific line.
+        #
+        # Case-sensitive on purpose, and no trailing window: these JDs run their
+        # requirements together with no punctuation at all, so a {0,100} tail
+        # swallows the stipend and deadline fields whole, and a case-blind run of
+        # leading words drags in the previous requirement ("interests are ...").
+        # A capitalised run stops at exactly the discipline.
+        m = re.search(r"(?:[A-Z][a-zA-Z&./-]*\s+){1,5}"
+                      r"(?:(?i:students?|graduates?|undergraduates?|freshers?))\b",
+                      body)
+    if not m:
         return None
     txt = clean(m.group(0))
+    # drop a copula the discipline-first branch drags in: the card shows the
+    # requirement, not the sentence it happened to sit in
+    txt = re.sub(r"^(?:are|is|be|from|who|only)\s+", "", txt, flags=re.I)
     # cut at a clause boundary so the card never shows a run-on fragment
     txt = re.split(r"\s+(?:and|with|plus)\s+(?:experience|demonstrated|proven)", txt)[0]
     if len(txt) > 120:
@@ -1256,9 +1660,13 @@ def score_job(j, prof, cfg):
                                 "2027", "graduate trainee", "campus hire", "new grad")):
         is_fulltime = True
 
-    # unpaid labeling
+    # unpaid labeling. An unpaid role is a materially worse opportunity than a paid
+    # one, so it also takes a score ceiling: without it, hydrated Internshala NGO
+    # listings were scoring 80-91 and calling themselves "Exceptional Match" purely
+    # because their JD happened to name his exact stack.
     if re.search(r"\bunpaid\b|without stipend|no stipend", body):
         reasons.append("⚠ UNPAID internship")
+        score = min(score, 68)
 
     return score, reasons, missing, is_fulltime
 
@@ -1350,11 +1758,36 @@ def summarize_jd(j):
 def extract_responsibilities(j, n=3):
     """Pull up to n responsibility bullets from the JD."""
     d = j.get("desc") or ""
-    seg = " ".join(re.findall(r"(?:responsibilit(?:y|ies)|what you['\u2019]?ll (?:do|work on)|"
-                              r"you will|your day(?: to day)?|key (?:duties|tasks))[\s\S]{0,700}", d, re.I))
-    if not seg:
-        seg = d
-    # bullet-ish sentences with verbs
+    cue = re.compile(r"(?:responsibilit(?:y|ies)|what you['\u2019]?ll (?:do|work on)|"
+                     r"you will|your day(?: to day)?|key (?:duties|tasks))[\s\S]{0,700}", re.I)
+    # Every JD carries a tail of equal-opportunity, benefits and legal prose, and those
+    # sentences use the same verbs the bullet filter looks for ("we support", "we will
+    # not tolerate"). They describe the employer, not the work, so they are never a
+    # responsibility no matter where they were found.
+    boiler = re.compile(r"equal opportunit|discriminat|regardless of (?:race|gender|age)"
+                        r"|veteran status|disability status|protected (?:class|characteristic)"
+                        r"|background check|privacy (?:policy|notice)|terms of use"
+                        r"|health insurance|paid time off|provident fund|401\(?k"
+                        r"|we are committed to|committed to (?:building|creating) a"
+                        r"|by (?:applying|submitting)|reasonable accommodation"
+                        r"|perks and benefits|our benefits", re.I)
+    # A capped window ends wherever the 700 characters run out -- mid-sentence as often
+    # as not -- and that leftover fragment then reads as a bullet of its own ("Design
+    # voice agent behavio"). Only a window with text after it was cut by the cap, so
+    # walk those back to the last sentence end; an uncapped window ended with the JD.
+    wins = []
+    for m in cue.finditer(d):
+        w = m.group(0)
+        if m.end() < len(d):
+            stop = max(w.rfind(c) for c in ".!?…")
+            w = w[:stop + 1] if stop >= 0 else ""
+        if w:
+            wins.append(w)
+    # No cue word at all is common (LinkedIn writes "Core Competencies", not
+    # "Responsibilities"), and the real bullets can sit anywhere in the body -- so the
+    # whole JD stays in scope. `boiler` is what keeps the EEO/benefits/legal sentences
+    # that live down there from being read as the role's work.
+    seg = " ".join(wins) or d
     verbs = ("build", "develop", "design", "create", "work", "maintain", "write", "test",
              "train", "analyze", "deploy", "collaborate", "implement", "research", "support",
              "optimize", "integrate", "build", "participate", "contribute")
@@ -1363,9 +1796,13 @@ def extract_responsibilities(j, n=3):
         s = re.sub(r"^(?:what you['\u2019]?ll (?:do|work on)|responsibilit(?:y|ies)|"
                    r"key (?:duties|tasks)|you will|your day(?: to day)?)\s*[:\u2013-]?\s*",
                    "", s, flags=re.I)
-        s = re.sub(r"^[-–—•\s]+", "", s)
+        s = re.sub(r"^[-\u2013\u2014\u2022\s]+", "", s)
+        if boiler.search(s):
+            continue
         if 20 < len(s) < 160 and any(v in s.lower() for v in verbs):
-            out.append(s[:150])
+            # 150 chars was a hard slice, so a long bullet stopped inside a word and gave
+            # no sign it had been cut. Break on the last space and say so, as line 1207 does.
+            out.append(s if len(s) <= 150 else s[:150].rsplit(" ", 1)[0] + "…")
         if len(out) >= n:
             break
     return out or ["As described in the posting — see direct link"]
@@ -1536,11 +1973,33 @@ def pay_flag(j):
 def split_full_rest(to_send, cfg):
     """Top N jobs get the full card; everything else goes in the compact digest.
     High-pay finds are promoted into the full-card tier regardless of rank — the
-    user asked to be told about those immediately."""
+    user asked to be told about those immediately. Beyond that, no single source
+    may take every slot: one aggregator having a good run should not hide the
+    company postings underneath it."""
     n = int(cfg.get("full_cards_per_run", 3))
     priority = [x for x in to_send if any("💎" in r for r in x[2])]
-    rest = [x for x in to_send if x not in priority]
-    top = priority + rest[:max(0, n - len(priority))]
+    top = list(priority)
+    per_source = {}
+    for x in priority:
+        s = x[1].get("source") or ""
+        per_source[s] = per_source.get(s, 0) + 1
+    limit = max(1, n - 1)          # leave at least one slot for a different source
+    for x in to_send:
+        if len(top) >= n:
+            break
+        if x in top:
+            continue
+        s = x[1].get("source") or ""
+        if per_source.get(s, 0) >= limit:
+            continue
+        per_source[s] = per_source.get(s, 0) + 1
+        top.append(x)
+    # if diversity left slots empty (only one source had anything), fill them
+    for x in to_send:
+        if len(top) >= n:
+            break
+        if x not in top:
+            top.append(x)
     return top, [x for x in to_send if x not in top]
 
 def compact_line(sc, j, r, m):
@@ -1588,7 +2047,19 @@ def compact_digest(items):
 
 # ------------------------------------------------------------------- main
 def main():
-    prof = load_json(BASE / "profile.json", {})
+    # The repo is public, so the resume must not live in it. PROFILE_JSON (a GitHub
+    # Secret) holds the whole profile as JSON; the local file is the fallback for
+    # local runs and is gitignored.
+    import os
+    prof = {}
+    raw = os.environ.get("PROFILE_JSON") or ""
+    if raw.strip():
+        try:
+            prof = json.loads(raw)
+        except ValueError as e:
+            log(f"PROFILE_JSON is not valid JSON ({e}); falling back to profile.json")
+    if not prof:
+        prof = load_json(BASE / "profile.json", {})
     cfg = load_json(BASE / "telegram.json", {}) or {}  # legacy email.json also still works
     # Credentials are normally empty here (they live in GitHub Secrets); that
     # must NOT discard the non-credential knobs in telegram.json (min_score,
@@ -1625,10 +2096,9 @@ def main():
             print("Failed:", e)
         return 0
     if not prof:
-        log("FATAL: profile.json missing or invalid")
+        log("FATAL: no profile — set the PROFILE_JSON secret or provide profile.json")
         return 1
     # environment overrides (Telegram bot only)
-    import os
     for env_key, cfg_key in [("TELEGRAM_BOT_TOKEN", "telegram_bot_token"),
                              ("TELEGRAM_CHAT_ID", "telegram_chat_id")]:
         if os.environ.get(env_key):
@@ -1782,14 +2252,26 @@ def main():
         return f"{c}|{r}"
 
     to_send = []
+    per_source = {}
+    caps = {"internshala": int(cfg.get("internshala_max_per_run", 3))}
+    n_capped = 0
     for x in scored:
         sc, j, r, m = x
         if j["id"] in seen:
             continue
         if fp_of(j) in fps:
             continue
+        # Per-source quota (Internshala only, per the user's "less attention to
+        # Internshala"). Hydration gave its listings real JDs, so they now score
+        # 75-91 and would otherwise fill the whole run and bury the company roles.
+        src = j.get("source") or ""
+        if src in caps and per_source.get(src, 0) >= caps[src]:
+            n_capped += 1
+            continue
+        per_source[src] = per_source.get(src, 0) + 1
         to_send.append(x)
-    log(f"to-send={len(to_send)} (of {len(scored)} scored)")
+    log(f"to-send={len(to_send)} (of {len(scored)} scored"
+        + (f", {n_capped} held back by source quota)" if n_capped else ")"))
 
     if dry:
         print("\n===== DRY RUN — what would be delivered =====")

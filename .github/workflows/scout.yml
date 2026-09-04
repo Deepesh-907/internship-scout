@@ -2,7 +2,10 @@ name: internship-scout
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 min (UTC); GitHub may add a few minutes' delay
+    # Public repo: Actions minutes are unlimited, so the cadence is only bounded by
+    # run length. Hydration takes ~3-4 min and the concurrency group queues rather
+    # than cancels, so */10 is the tightest interval that cannot overlap itself.
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -28,6 +31,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # the resume itself — kept out of the public repo
+          PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
 
       - name: Persist seen-state
         run: |
