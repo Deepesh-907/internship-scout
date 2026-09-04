@@ -1,10 +1,11 @@
 name: internship-scout
 
 on:
+  # GitHub's cron is best-effort and drops most fires (measured: 28 of ~268 due,
+  # median gap 4 hours, no gap under 35 min -- going public did not change it).
+  # So the schedule is only a *starter*: each run then scans on its own loop until
+  # the next one takes over, which is what actually delivers a steady interval.
   schedule:
-    # Public repo: Actions minutes are unlimited, so the cadence is only bounded by
-    # run length. Hydration takes ~3-4 min and the concurrency group queues rather
-    # than cancels, so */10 is the tightest interval that cannot overlap itself.
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
@@ -12,13 +13,16 @@ permissions:
   contents: write
 
 concurrency:
+  # A fresh fire replaces the running loop instead of queueing behind it: queued
+  # runs would pile up and each still has to wait out the whole loop.
   group: scout
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 6 h is the hosted-runner ceiling; the loop stops itself before that.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -26,17 +30,49 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Scan + deliver alerts
-        run: python scout.py
+      - name: Self-test
+        run: python -m unittest discover -s tests -t . -q
+
+      - name: Scan on a loop until the next run takes over
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # the resume itself — kept out of the public repo
+          # the resume itself -- kept out of the public repo
           PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
-
-      - name: Persist seen-state
+          INTERVAL_SECONDS: "600"
+          LOOP_MINUTES: "330"
         run: |
+          set -u
           git config user.name "scout-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state/seen.json state/source_errors.json
-          git diff --cached --quiet || (git commit -m "state update [skip ci]" && git push)
+          deadline=$(( SECONDS + LOOP_MINUTES * 60 ))
+          pass=0
+          while :; do
+            pass=$(( pass + 1 ))
+            started=$SECONDS
+            echo "::group::scan pass $pass"
+            # A first-pass failure is a real breakage (bad PROFILE_JSON, syntax
+            # error) and must fail the job loudly. Later passes hit transient
+            # network errors, which must not kill a loop that is still useful.
+            if ! python scout.py; then
+              if [ "$pass" -eq 1 ]; then
+                echo "::error::first scan failed - stopping"
+                exit 1
+              fi
+              echo "::warning::scan pass $pass failed, continuing"
+            fi
+            echo "::endgroup::"
+            # Persist dedup state every pass, so a cancelled loop never re-alerts
+            # jobs it already sent.
+            git add state/seen.json state/source_errors.json
+            if ! git diff --cached --quiet; then
+              git commit -q -m "state update [skip ci]"
+              git push -q origin main \
+                || { git pull -q --rebase --no-edit origin main && git push -q origin main; } \
+                || echo "::warning::state push deferred to next pass"
+            fi
+            [ "$SECONDS" -ge "$deadline" ] && break
+            # keep passes INTERVAL_SECONDS apart, counting the scan's own runtime
+            rest=$(( INTERVAL_SECONDS - (SECONDS - started) ))
+            [ "$rest" -gt 0 ] && sleep "$rest"
+          done
