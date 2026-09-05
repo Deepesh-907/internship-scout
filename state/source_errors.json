@@ -8,7 +8,7 @@
   "last_error": "HTTP Error 403: Forbidden"
  },
  "remoteok": {
-  "consecutive": 1,
+  "consecutive": 2,
   "last_error": "The read operation timed out"
  }
 }
