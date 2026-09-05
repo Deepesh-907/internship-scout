@@ -2,5 +2,9 @@
  "indeed": {
   "consecutive": 8,
   "last_error": "HTTP Error 403: Forbidden"
+ },
+ "jobicy": {
+  "consecutive": 1,
+  "last_error": "HTTP Error 403: Forbidden"
  }
 }
