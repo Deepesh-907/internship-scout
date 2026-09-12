@@ -6,9 +6,5 @@
  "jobicy": {
   "consecutive": 8,
   "last_error": "HTTP Error 403: Forbidden"
- },
- "linkedin": {
-  "consecutive": 1,
-  "last_error": "HTTP Error 429: Too Many Requests"
  }
 }
