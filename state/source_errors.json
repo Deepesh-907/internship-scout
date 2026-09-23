@@ -6,5 +6,9 @@
  "jobicy": {
   "consecutive": 8,
   "last_error": "HTTP Error 403: Forbidden"
+ },
+ "remoteok": {
+  "consecutive": 1,
+  "last_error": "The read operation timed out"
  }
 }
