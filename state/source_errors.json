@@ -6,5 +6,9 @@
  "jobicy": {
   "consecutive": 8,
   "last_error": "HTTP Error 403: Forbidden"
+ },
+ "youtube": {
+  "consecutive": 1,
+  "last_error": "IncompleteRead(58518 bytes read)"
  }
 }
