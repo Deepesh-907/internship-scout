@@ -6,5 +6,9 @@
  "jobicy": {
   "consecutive": 8,
   "last_error": "HTTP Error 403: Forbidden"
+ },
+ "netflix": {
+  "consecutive": 1,
+  "last_error": "HTTP Error 429: TOO MANY REQUESTS"
  }
 }
