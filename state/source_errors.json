@@ -8,7 +8,11 @@
   "last_error": "HTTP Error 403: Forbidden"
  },
  "netflix": {
-  "consecutive": 3,
+  "consecutive": 4,
   "last_error": "HTTP Error 429: TOO MANY REQUESTS"
+ },
+ "linkedin": {
+  "consecutive": 1,
+  "last_error": "HTTP Error 429: Too Many Requests"
  }
 }
