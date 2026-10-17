@@ -12,7 +12,11 @@
   "last_error": "'str' object has no attribute 'get'"
  },
  "linkedin": {
-  "consecutive": 2,
+  "consecutive": 3,
   "last_error": "HTTP Error 429: Too Many Requests"
+ },
+ "netflix": {
+  "consecutive": 1,
+  "last_error": "HTTP Error 429: TOO MANY REQUESTS"
  }
 }
