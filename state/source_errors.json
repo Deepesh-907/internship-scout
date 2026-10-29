@@ -10,9 +10,5 @@
  "yc": {
   "consecutive": 8,
   "last_error": "'str' object has no attribute 'get'"
- },
- "remoteok": {
-  "consecutive": 2,
-  "last_error": "<urlopen error _ssl.c:993: The handshake operation timed out>"
  }
 }
