@@ -11,8 +11,8 @@
   "consecutive": 8,
   "last_error": "'str' object has no attribute 'get'"
  },
- "netflix": {
+ "arbeitnow": {
   "consecutive": 1,
-  "last_error": "HTTP Error 429: TOO MANY REQUESTS"
+  "last_error": "IncompleteRead(3471920 bytes read)"
  }
 }
