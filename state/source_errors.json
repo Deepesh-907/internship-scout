@@ -10,5 +10,9 @@
  "yc": {
   "consecutive": 8,
   "last_error": "'str' object has no attribute 'get'"
+ },
+ "netflix": {
+  "consecutive": 1,
+  "last_error": "HTTP Error 429: TOO MANY REQUESTS"
  }
 }
